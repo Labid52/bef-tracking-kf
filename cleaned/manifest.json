@@ -1,0 +1,29 @@
+{
+  "source_matrix_dir": "/home/labid/Videos/longitudinal_control/matrix",
+  "source_frames": 3477,
+  "source_sha256": "22042ae1eb8b75ebd88d4587f25b1803dc22f213c9b828a809ebeec8ce7347ee",
+  "first_frame": "000000.npy",
+  "last_frame": "003476.npy",
+  "mode": "offline",
+  "uses_future_frames": true,
+  "fps": 10.0,
+  "dt_s": 0.1,
+  "duration_s": 347.7,
+  "grid": {
+    "rows": 120,
+    "cols": 80,
+    "cell_size_m": 1.0,
+    "ego_row": 80,
+    "ego_col": 40
+  },
+  "n_tracks": 1169,
+  "n_emitted_objects": 22817,
+  "raw_nonzero_cells": 20273,
+  "cleaned_nonzero_cells": 22810,
+  "provenance_counts": {
+    "observed": 19024,
+    "interpolated": 3658,
+    "passthrough": 135
+  },
+  "elapsed_s": 15.1
+}

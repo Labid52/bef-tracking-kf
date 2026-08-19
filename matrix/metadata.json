@@ -1,0 +1,32 @@
+{
+  "dtype": "uint8",
+  "shape_rows_columns": [
+    120,
+    80
+  ],
+  "physical_width_height_m": [
+    80.0,
+    120.0
+  ],
+  "cell_size_m": 1.0,
+  "row_0": "forward +80m",
+  "last_row": "rear -40m",
+  "column_0": "left -40m",
+  "last_column": "right +40m",
+  "class_ids": {
+    "0": "empty",
+    "1": "person",
+    "2": "bicycle",
+    "3": "car",
+    "4": "motorcycle",
+    "5": "bus",
+    "6": "truck",
+    "7": "stop sign",
+    "8": "traffic light",
+    "9": "red",
+    "10": "yellow",
+    "11": "green",
+    "255": "unknown"
+  },
+  "cell_conflict": "highest-confidence detection wins"
+}
