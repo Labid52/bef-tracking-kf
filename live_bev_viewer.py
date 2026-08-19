@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""
+Live / causal BEV viewer for the longitudinal-control project.
+
+This file DOES NOT change the accepted tracking method.  It is only a live
+wrapper around ``OnlineTemporalCleaner.update()``.
+
+Production use
+--------------
+Create ONE ``LiveBEVProcessor`` when the perception process starts.  For every
+new 120x80 semantic matrix, call ``processor.update(raw_matrix, ...)`` exactly
+once.  The processor keeps all Kalman / track history internally and returns
+the stabilized matrix and current tracked-object states immediately.
+
+Recorded-data replay
+--------------------
+This script can also replay the existing ``matrix/*.npy`` files at 10 Hz.  The
+files are consumed one at a time in chronological order; future matrices are
+never given to the cleaner.  This is useful for testing the exact live code
+path before connecting it to the NVIDIA DRIVE Thor perception publisher.
+
+Examples
+--------
+    python3 live_bev_viewer.py
+    python3 live_bev_viewer.py --start 1110 --end 1190
+    python3 live_bev_viewer.py --no-realtime
+    python3 live_bev_viewer.py --headless --no-realtime
+
+Keys in the OpenCV window
+-------------------------
+    q / ESC : quit
+    p       : pause / resume replay
+    r       : reset the causal tracker
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+import time
+from typing import List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+import control_params as cp
+import temporal_matrix_cleaner as tmc
+from temporal_matrix_cleaner import OnlineTemporalCleaner
+from target_speed import getTargetSpeed
+
+
+# ---------------------------------------------------------------------------
+# Visualization metadata only.  These values do not affect tracking/control.
+# OpenCV colors are BGR.
+# ---------------------------------------------------------------------------
+CLASS_STYLE = {
+    1: ("person",        (60, 70, 230)),
+    2: ("bicycle",       (60, 135, 230)),
+    3: ("car",           (230, 140, 60)),
+    4: ("motorcycle",    (220, 80, 150)),
+    5: ("bus",           (180, 160, 20)),
+    6: ("truck",         (160, 95, 30)),
+    7: ("stop sign",     (20, 20, 220)),
+    8: ("traffic light", (135, 135, 135)),
+    9: ("red light",     (20, 20, 220)),
+    10: ("yellow light", (20, 190, 220)),
+    11: ("green light",  (40, 180, 40)),
+}
+DEFAULT_STYLE = ("unknown", (150, 150, 150))
+
+
+@dataclass
+class LiveFrameResult:
+    """Output of one real-time cleaner update."""
+
+    frame_index: int
+    cleaned_matrix: np.ndarray
+    objects: List[dict]
+    raw_target_speed_mph: float
+    cleaned_target_speed_mph: float
+    tracker_latency_ms: float
+    active_tracks: int
+    coasted_tracks: int
+    ego_speed_mps: float
+    ego_yaw_rate_rps: float
+
+
+class LiveBEVProcessor:
+    """Persistent causal perception post-processor.
+
+    Instantiate this class ONCE.  Each call to :meth:`update` consumes only the
+    current matrix; all past information needed by the Kalman/data-association
+    tracker is retained inside ``self.cleaner``.
+    """
+
+    def __init__(self) -> None:
+        self.cleaner = OnlineTemporalCleaner()
+        self.frame_index = -1
+
+    def update(
+        self,
+        raw_matrix: np.ndarray,
+        *,
+        dt: float = cp.DT,
+        ego_yaw_rate: Optional[float] = None,
+        ego_speed_mps: Optional[float] = None,
+    ) -> LiveFrameResult:
+        """Process exactly one current 120x80 semantic matrix.
+
+        Parameters
+        ----------
+        raw_matrix:
+            Current semantic matrix.  No previous/future matrices are required.
+        dt:
+            Time since the previous update.  For the validated dataset this is
+            0.10 s.  On the live system pass the actual measured interval if the
+            perception cadence is not perfectly periodic.
+        ego_yaw_rate:
+            Optional measured yaw rate [rad/s].  If available from the vehicle
+            IMU/localization stack, pass it here; otherwise the existing causal
+            scene-based estimator is used.
+        ego_speed_mps:
+            Optional measured ego speed [m/s], used by the existing cleaner for
+            annotation/static classification as defined by its current API.
+        """
+        raw = np.asarray(raw_matrix)
+        if raw.shape != (tmc.ROWS, tmc.COLS):
+            raise ValueError(
+                f"raw_matrix must have shape {(tmc.ROWS, tmc.COLS)}, got {raw.shape}"
+            )
+        if raw.dtype != np.uint8:
+            raw = raw.astype(np.uint8, copy=False)
+
+        self.frame_index += 1
+
+        t0 = time.perf_counter()
+        cleaned, objects = self.cleaner.update(
+            raw,
+            dt=float(dt),
+            ego_yaw_rate=ego_yaw_rate,
+            ego_speed_mps=ego_speed_mps,
+        )
+        tracker_latency_ms = (time.perf_counter() - t0) * 1e3
+
+        ts_raw = float(getTargetSpeed(matrix=raw, **cp.TARGET_SPEED_KW))
+        ts_clean = float(getTargetSpeed(matrix=cleaned, **cp.TARGET_SPEED_KW))
+
+        coasted = sum(
+            1 for obj in objects
+            if obj.get("provenance") == tmc.PROV_COASTED or not bool(obj.get("observed", True))
+        )
+
+        return LiveFrameResult(
+            frame_index=self.frame_index,
+            cleaned_matrix=cleaned,
+            objects=objects,
+            raw_target_speed_mph=ts_raw,
+            cleaned_target_speed_mph=ts_clean,
+            tracker_latency_ms=tracker_latency_ms,
+            active_tracks=len(objects),
+            coasted_tracks=coasted,
+            ego_speed_mps=float(self.cleaner.ego_speed_mps),
+            ego_yaw_rate_rps=float(self.cleaner.ego_yaw_rate),
+        )
+
+    def reset(self) -> None:
+        """Clear all temporal state (for a new drive/route/session)."""
+        self.cleaner.reset()
+        self.frame_index = -1
+
+
+class BEVRenderer:
+    """OpenCV renderer for raw vs. live causal BEV.
+
+    Rendering is intentionally separate from :class:`LiveBEVProcessor`, so the
+    control path can use ``cleaned_matrix`` even when visualization is disabled.
+    """
+
+    def __init__(
+        self,
+        pixels_per_meter: float = 6.0,
+        x_min_m: float = -20.0,
+        x_max_m: float = 80.0,
+        y_min_m: float = -40.0,
+        y_max_m: float = 40.0,
+    ) -> None:
+        self.ppm = float(pixels_per_meter)
+        self.x_min = float(x_min_m)
+        self.x_max = float(x_max_m)
+        self.y_min = float(y_min_m)
+        self.y_max = float(y_max_m)
+        self.panel_w = int(round((self.y_max - self.y_min) * self.ppm))
+        self.panel_h = int(round((self.x_max - self.x_min) * self.ppm))
+        self.info_h = 92
+
+    def _xy_to_px(self, x_forward: float, y_right: float) -> Tuple[int, int]:
+        px = int(round((y_right - self.y_min) * self.ppm))
+        py = int(round((self.x_max - x_forward) * self.ppm))
+        return px, py
+
+    def _base_panel(self, title: str, subtitle: str = "") -> np.ndarray:
+        img = np.full((self.panel_h, self.panel_w, 3), 248, dtype=np.uint8)
+
+        # Grid every 10 m.
+        for x in np.arange(np.ceil(self.x_min / 10) * 10, self.x_max + 0.1, 10):
+            p1 = self._xy_to_px(float(x), self.y_min)
+            p2 = self._xy_to_px(float(x), self.y_max)
+            cv2.line(img, p1, p2, (220, 220, 220), 1, cv2.LINE_AA)
+        for y in np.arange(np.ceil(self.y_min / 10) * 10, self.y_max + 0.1, 10):
+            p1 = self._xy_to_px(self.x_min, float(y))
+            p2 = self._xy_to_px(self.x_max, float(y))
+            cv2.line(img, p1, p2, (225, 225, 225), 1, cv2.LINE_AA)
+
+        # Object corridor used by target speed: +/- width_of_interest/2.
+        hw = cp.WIDTH_OF_INTEREST_M / 2.0
+        left_top = self._xy_to_px(self.x_max, -hw)
+        right_bottom = self._xy_to_px(0.0, hw)
+        overlay = img.copy()
+        cv2.rectangle(overlay, left_top, right_bottom, (245, 230, 215), -1)
+        cv2.addWeighted(overlay, 0.28, img, 0.72, 0, img)
+
+        # Stop-sign lateral gate +/- 15 m, outline only.
+        stop_left_top = self._xy_to_px(self.x_max, -cp.STOP_LATERAL_LIMIT_M)
+        stop_right_bottom = self._xy_to_px(0.0, cp.STOP_LATERAL_LIMIT_M)
+        cv2.rectangle(img, stop_left_top, stop_right_bottom, (190, 190, 240), 1)
+
+        # Ego axes and marker.
+        p0 = self._xy_to_px(0.0, 0.0)
+        cv2.line(img, self._xy_to_px(self.x_min, 0), self._xy_to_px(self.x_max, 0),
+                 (100, 100, 100), 1, cv2.LINE_AA)
+        cv2.circle(img, p0, 7, (20, 20, 20), -1, cv2.LINE_AA)
+        tip = self._xy_to_px(3.0, 0.0)
+        cv2.arrowedLine(img, p0, tip, (20, 20, 20), 2, tipLength=0.35)
+
+        cv2.putText(img, title, (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (20, 20, 20), 2, cv2.LINE_AA)
+        if subtitle:
+            cv2.putText(img, subtitle, (12, 43), cv2.FONT_HERSHEY_SIMPLEX, 0.43,
+                        (70, 70, 70), 1, cv2.LINE_AA)
+        return img
+
+    @staticmethod
+    def _style(cls: int) -> Tuple[str, Tuple[int, int, int]]:
+        return CLASS_STYLE.get(int(cls), DEFAULT_STYLE)
+
+    def _draw_raw(self, raw: np.ndarray) -> np.ndarray:
+        img = self._base_panel("RAW CURRENT-FRAME DETECTIONS", "current matrix only")
+        rr, cc = np.nonzero(raw)
+        for r, c in zip(rr.tolist(), cc.tolist()):
+            cls = int(raw[r, c])
+            x = float(tmc.EGO_ROW - r)
+            y = float(c - tmc.EGO_COL)
+            if not (self.x_min <= x <= self.x_max and self.y_min <= y <= self.y_max):
+                continue
+            name, color = self._style(cls)
+            px = self._xy_to_px(x, y)
+            cv2.circle(img, px, 6, color, -1, cv2.LINE_AA)
+            cv2.circle(img, px, 6, (30, 30, 30), 1, cv2.LINE_AA)
+        return img
+
+    def _draw_tracks(self, objects: List[dict]) -> np.ndarray:
+        img = self._base_panel("ONLINE / CAUSAL TRACKING", "Future frames used: NO")
+        for obj in objects:
+            x = float(obj["x"])
+            y = float(obj["y"])
+            if not (self.x_min <= x <= self.x_max and self.y_min <= y <= self.y_max):
+                continue
+            cls = int(obj["cls"])
+            tid = int(obj.get("tid", -1))
+            name, color = self._style(cls)
+            px = self._xy_to_px(x, y)
+
+            cv2.circle(img, px, 7, color, -1, cv2.LINE_AA)
+            cv2.circle(img, px, 7, (30, 30, 30), 1, cv2.LINE_AA)
+
+            prov = obj.get("provenance", tmc.PROV_OBSERVED)
+            if prov == tmc.PROV_COASTED:
+                cv2.circle(img, px, 10, (0, 140, 255), 2, cv2.LINE_AA)
+                status = " C"
+            elif prov == tmc.PROV_PASSTHROUGH:
+                cv2.circle(img, px, 10, (30, 180, 30), 2, cv2.LINE_AA)
+                status = " S"
+            else:
+                status = ""
+
+            label = f"{name} #{tid}{status}" if tid >= 0 else f"{name}{status}"
+            cv2.putText(img, label, (px[0] + 8, px[1] - 7),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (30, 30, 30), 1,
+                        cv2.LINE_AA)
+
+            # Velocity arrow: short visualization only; does not affect tracking.
+            vx = float(obj.get("wx", 0.0))
+            vy = float(obj.get("wy", 0.0))
+            mag = float(np.hypot(vx, vy))
+            if mag > 0.25:
+                horizon_s = min(0.5, 4.0 / mag)
+                qx = x + vx * horizon_s
+                qy = y + vy * horizon_s
+                q = self._xy_to_px(qx, qy)
+                cv2.arrowedLine(img, px, q, (70, 70, 70), 1, cv2.LINE_AA,
+                                tipLength=0.25)
+        return img
+
+    def render(self, raw: np.ndarray, result: LiveFrameResult) -> np.ndarray:
+        left = self._draw_raw(raw)
+        right = self._draw_tracks(result.objects)
+        body = np.hstack([left, right])
+
+        info = np.full((self.info_h, body.shape[1], 3), 250, dtype=np.uint8)
+        elapsed = result.frame_index * cp.DT
+        line1 = (
+            f"frame {result.frame_index:06d}   time {elapsed:7.1f} s   "
+            f"tracker {result.tracker_latency_ms:6.2f} ms   "
+            f"active {result.active_tracks:2d}   coasted {result.coasted_tracks:2d}"
+        )
+        line2 = (
+            f"target speed: raw {result.raw_target_speed_mph:5.2f} mph   "
+            f"online {result.cleaned_target_speed_mph:5.2f} mph   "
+            f"ego yaw {result.ego_yaw_rate_rps:+.3f} rad/s   "
+            f"ego speed est {result.ego_speed_mps:5.2f} m/s"
+        )
+        line3 = "q/ESC quit   p pause   r reset tracker    C=coasted prediction   S=safety pass-through"
+        cv2.putText(info, line1, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.56,
+                    (20, 20, 20), 1, cv2.LINE_AA)
+        cv2.putText(info, line2, (12, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.56,
+                    (20, 20, 20), 1, cv2.LINE_AA)
+        cv2.putText(info, line3, (12, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                    (80, 80, 80), 1, cv2.LINE_AA)
+        return np.vstack([body, info])
+
+
+# ---------------------------------------------------------------------------
+# Recorded sequence replay.  This exercises the SAME one-matrix update() API
+# that the live perception callback will use on Thor.
+# ---------------------------------------------------------------------------
+def replay_matrix_directory(args: argparse.Namespace) -> None:
+    files = sorted(Path(args.matrix_dir).glob("*.npy"))
+    if not files:
+        raise FileNotFoundError(f"no .npy matrices found in {args.matrix_dir}")
+
+    start = max(0, int(args.start))
+    end = len(files) if args.end is None else min(len(files), int(args.end))
+    files = files[start:end]
+    if not files:
+        raise ValueError("empty replay frame range")
+
+    processor = LiveBEVProcessor()
+    renderer = BEVRenderer(pixels_per_meter=args.ppm)
+    paused = False
+    latencies: List[float] = []
+
+    print(f"Live causal replay: {len(files)} frames from {args.matrix_dir}")
+    print(f"Timing: {cp.FPS:.0f} Hz, nominal dt={cp.DT:.3f} s")
+    print("Future frames are not supplied to OnlineTemporalCleaner.update().")
+
+    try:
+        for path in files:
+            loop_start = time.perf_counter()
+            raw = np.load(path)
+            result = processor.update(raw, dt=cp.DT)
+            latencies.append(result.tracker_latency_ms)
+
+            if not args.headless:
+                canvas = renderer.render(raw, result)
+                cv2.imshow(args.window_name, canvas)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key in (27, ord("q")):
+                    break
+                if key == ord("r"):
+                    processor.reset()
+                    print("tracker reset")
+                if key == ord("p"):
+                    paused = not paused
+
+                while paused:
+                    key = cv2.waitKey(30) & 0xFF
+                    if key in (27, ord("q")):
+                        return
+                    if key == ord("p"):
+                        paused = False
+                    elif key == ord("r"):
+                        processor.reset()
+                        print("tracker reset")
+
+            if args.realtime:
+                remaining = cp.DT - (time.perf_counter() - loop_start)
+                if remaining > 0:
+                    time.sleep(remaining)
+    finally:
+        if not args.headless:
+            cv2.destroyAllWindows()
+
+    if latencies:
+        a = np.asarray(latencies, dtype=float)
+        print(
+            "tracker update latency [ms]: "
+            f"mean={a.mean():.2f}, p95={np.percentile(a,95):.2f}, "
+            f"p99={np.percentile(a,99):.2f}, max={a.max():.2f}; "
+            f"10-Hz budget={cp.DT*1000:.0f} ms"
+        )
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--matrix-dir", type=Path, default=cp.MATRIX_DIR,
+                    help="recorded matrices for live-style replay")
+    ap.add_argument("--start", type=int, default=0)
+    ap.add_argument("--end", type=int, default=None)
+    ap.add_argument("--ppm", type=float, default=6.0,
+                    help="display pixels per meter (visualization only)")
+    ap.add_argument("--window-name", default="Live Causal BEV")
+    ap.add_argument("--headless", action="store_true",
+                    help="run tracker without opening an OpenCV window")
+    ap.add_argument("--no-realtime", dest="realtime", action="store_false",
+                    help="replay as fast as possible instead of sleeping to 10 Hz")
+    ap.set_defaults(realtime=True)
+    return ap.parse_args()
+
+
+def main() -> None:
+    replay_matrix_directory(parse_args())
+
+
+if __name__ == "__main__":
+    main()
