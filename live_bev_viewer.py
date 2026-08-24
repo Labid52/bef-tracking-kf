@@ -84,6 +84,8 @@ class LiveFrameResult:
     coasted_tracks: int
     ego_speed_mps: float
     ego_yaw_rate_rps: float
+    dt_s: float = cp.LIVE_DT
+    elapsed_s: float = 0.0
 
 
 class LiveBEVProcessor:
@@ -94,15 +96,36 @@ class LiveBEVProcessor:
     tracker is retained inside ``self.cleaner``.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, nominal_dt: float = cp.LIVE_DT) -> None:
         self.cleaner = OnlineTemporalCleaner()
         self.frame_index = -1
+        self.nominal_dt = float(nominal_dt)
+        self.elapsed_s = 0.0
+        self._last_monotonic: Optional[float] = None
+        self.dt_clamped = 0          # times a measured dt hit the guard rails
+
+    def measure_dt(self) -> float:
+        """Interval since the previous call, from the monotonic clock.
+
+        Use this when the caller has no timestamp of its own::
+
+            cleaned, objs = proc.update(matrix, dt=proc.measure_dt())
+
+        The first call returns the nominal dt because there is no predecessor.
+        """
+        now = time.monotonic()
+        if self._last_monotonic is None:
+            self._last_monotonic = now
+            return self.nominal_dt
+        dt = now - self._last_monotonic
+        self._last_monotonic = now
+        return dt
 
     def update(
         self,
         raw_matrix: np.ndarray,
         *,
-        dt: float = cp.DT,
+        dt: Optional[float] = None,
         ego_yaw_rate: Optional[float] = None,
         ego_speed_mps: Optional[float] = None,
     ) -> LiveFrameResult:
@@ -113,9 +136,16 @@ class LiveBEVProcessor:
         raw_matrix:
             Current semantic matrix.  No previous/future matrices are required.
         dt:
-            Time since the previous update.  For the validated dataset this is
-            0.10 s.  On the live system pass the actual measured interval if the
-            perception cadence is not perfectly periodic.
+            Measured seconds since the previous update.  Pass the real interval;
+            the tracker is fully rate-aware.  ``None`` uses the nominal rate
+            (20 Hz live, or whatever this processor was constructed with).
+
+            ABNORMAL dt POLICY: a value outside
+            [temporal_matrix_cleaner.DT_MIN, DT_MAX] = [0.005, 0.5] s is clamped
+            into that range and counted in ``self.dt_clamped``.  Clamping is
+            deliberate: a scheduling stall of several seconds must not be turned
+            into several seconds of blind constant-velocity extrapolation.  The
+            coast policy then ages the affected tracks out normally.
         ego_yaw_rate:
             Optional measured yaw rate [rad/s].  If available from the vehicle
             IMU/localization stack, pass it here; otherwise the existing causal
@@ -132,12 +162,20 @@ class LiveBEVProcessor:
         if raw.dtype != np.uint8:
             raw = raw.astype(np.uint8, copy=False)
 
+        if dt is None:
+            dt = self.nominal_dt
+        dt = float(dt)
+        if not (tmc.DT_MIN <= dt <= tmc.DT_MAX):
+            self.dt_clamped += 1
+            dt = min(max(dt, tmc.DT_MIN), tmc.DT_MAX)
+
         self.frame_index += 1
+        self.elapsed_s += dt
 
         t0 = time.perf_counter()
         cleaned, objects = self.cleaner.update(
             raw,
-            dt=float(dt),
+            dt=dt,
             ego_yaw_rate=ego_yaw_rate,
             ego_speed_mps=ego_speed_mps,
         )
@@ -162,12 +200,17 @@ class LiveBEVProcessor:
             coasted_tracks=coasted,
             ego_speed_mps=float(self.cleaner.ego_speed_mps),
             ego_yaw_rate_rps=float(self.cleaner.ego_yaw_rate),
+            dt_s=dt,
+            elapsed_s=self.elapsed_s,
         )
 
     def reset(self) -> None:
         """Clear all temporal state (for a new drive/route/session)."""
         self.cleaner.reset()
         self.frame_index = -1
+        self.elapsed_s = 0.0
+        self._last_monotonic = None
+        self.dt_clamped = 0
 
 
 class BEVRenderer:
@@ -193,6 +236,18 @@ class BEVRenderer:
         self.panel_w = int(round((self.y_max - self.y_min) * self.ppm))
         self.panel_h = int(round((self.x_max - self.x_min) * self.ppm))
         self.info_h = 92
+
+        # ---- VISUALIZATION-ONLY state ---------------------------------------
+        # Previous displayed continuous position per track id, used solely to
+        # draw the motion arrow along the apparent BEV motion the viewer sees.
+        # This is never read by OnlineTemporalCleaner, the Kalman state, the
+        # association, the target-speed computation or the cleaned matrix.
+        #   previous_display_position[tid] = (x_forward_m, y_right_m, t_seconds)
+        self.previous_display_position: dict = {}
+        self._display_clock_s = 0.0
+        # Drop visualization history this long after a track stops being drawn,
+        # so a later track id can never inherit a stale arrow state.
+        self._display_history_ttl_s = 1.0
 
     def _xy_to_px(self, x_forward: float, y_right: float) -> Tuple[int, int]:
         px = int(round((y_right - self.y_min) * self.ppm))
@@ -240,6 +295,15 @@ class BEVRenderer:
                         (70, 70, 70), 1, cv2.LINE_AA)
         return img
 
+    def reset_display_history(self) -> None:
+        """Forget the visualization-only arrow history.
+
+        Called whenever the tracker is reset, because track ids restart from
+        zero and a new track must not inherit the previous session's position.
+        """
+        self.previous_display_position.clear()
+        self._display_clock_s = 0.0
+
     @staticmethod
     def _style(cls: int) -> Tuple[str, Tuple[int, int, int]]:
         return CLASS_STYLE.get(int(cls), DEFAULT_STYLE)
@@ -259,8 +323,14 @@ class BEVRenderer:
             cv2.circle(img, px, 6, (30, 30, 30), 1, cv2.LINE_AA)
         return img
 
-    def _draw_tracks(self, objects: List[dict]) -> np.ndarray:
+    def _draw_tracks(self, objects: List[dict], dt: float = cp.DT) -> np.ndarray:
         img = self._base_panel("ONLINE / CAUSAL TRACKING", "Future frames used: NO")
+        # Advance the visualization clock by the real elapsed time of this
+        # update, so the arrow uses the ACTUAL interval between the two
+        # displayed states even if a track was not drawn for a few frames.
+        self._display_clock_s += float(dt)
+        now = self._display_clock_s
+        seen_this_frame = set()
         for obj in objects:
             x = float(obj["x"])
             y = float(obj["y"])
@@ -289,26 +359,55 @@ class BEVRenderer:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.40, (30, 30, 30), 1,
                         cv2.LINE_AA)
 
-            # Velocity arrow: short visualization only; does not affect tracking.
-            vx = float(obj.get("wx", 0.0))
-            vy = float(obj.get("wy", 0.0))
-            mag = float(np.hypot(vx, vy))
-            if mag > 0.25:
-                horizon_s = min(0.5, 4.0 / mag)
-                qx = x + vx * horizon_s
-                qy = y + vy * horizon_s
-                q = self._xy_to_px(qx, qy)
-                cv2.arrowedLine(img, px, q, (70, 70, 70), 1, cv2.LINE_AA,
-                                tipLength=0.25)
+            # ---- Velocity arrow: visualization only, never fed back ----------
+            # It must point along the motion the viewer actually sees, so it is
+            # derived from THIS track's previous and current displayed
+            # continuous positions rather than from the tracker's internal
+            # Kalman state (wx, wy), which is yaw-compensated and therefore not
+            # always the apparent on-screen motion:
+            #
+            #     vx_display = (x_curr - x_prev) / dt_display
+            #     vy_display = (y_curr - y_prev) / dt_display
+            #
+            # Pass-through emissions share tid = -1 and are not one persistent
+            # object, so they are never chained.  A track with only one displayed
+            # position yet gets no arrow.
+            if tid >= 0:
+                seen_this_frame.add(tid)
+                prev = self.previous_display_position.get(tid)
+                if prev is not None:
+                    x_prev, y_prev, t_prev = prev
+                    dt_display = now - t_prev
+                    if dt_display > 0.0:
+                        vx = (x - x_prev) / dt_display
+                        vy = (y - y_prev) / dt_display
+                        mag = float(np.hypot(vx, vy))
+                        if mag > 0.25:
+                            horizon_s = min(0.5, 4.0 / mag)
+                            qx = x + vx * horizon_s
+                            qy = y + vy * horizon_s
+                            q = self._xy_to_px(qx, qy)
+                            cv2.arrowedLine(img, px, q, (70, 70, 70), 1,
+                                            cv2.LINE_AA, tipLength=0.25)
+                self.previous_display_position[tid] = (x, y, now)
+
+        # Expire visualization history for tracks that are no longer drawn.
+        for tid_old in [t for t, v in self.previous_display_position.items()
+                        if t not in seen_this_frame
+                        and now - v[2] > self._display_history_ttl_s]:
+            del self.previous_display_position[tid_old]
         return img
 
-    def render(self, raw: np.ndarray, result: LiveFrameResult) -> np.ndarray:
+    def render(self, raw: np.ndarray, result: LiveFrameResult,
+               dt: float = cp.DT) -> np.ndarray:
+        """``dt`` is the real interval since the previous rendered frame; it is
+        used only for the visualization arrow direction."""
         left = self._draw_raw(raw)
-        right = self._draw_tracks(result.objects)
+        right = self._draw_tracks(result.objects, dt=dt)
         body = np.hstack([left, right])
 
         info = np.full((self.info_h, body.shape[1], 3), 250, dtype=np.uint8)
-        elapsed = result.frame_index * cp.DT
+        elapsed = getattr(result, "elapsed_s", result.frame_index * cp.DT)
         line1 = (
             f"frame {result.frame_index:06d}   time {elapsed:7.1f} s   "
             f"tracker {result.tracker_latency_ms:6.2f} ms   "
@@ -345,24 +444,28 @@ def replay_matrix_directory(args: argparse.Namespace) -> None:
     if not files:
         raise ValueError("empty replay frame range")
 
-    processor = LiveBEVProcessor()
+    dt_nominal = float(args.dt)
+    processor = LiveBEVProcessor(nominal_dt=dt_nominal)
     renderer = BEVRenderer(pixels_per_meter=args.ppm)
     paused = False
     latencies: List[float] = []
 
     print(f"Live causal replay: {len(files)} frames from {args.matrix_dir}")
-    print(f"Timing: {cp.FPS:.0f} Hz, nominal dt={cp.DT:.3f} s")
+    print(f"Timing: {1.0/dt_nominal:.1f} Hz, nominal dt={dt_nominal:.3f} s")
     print("Future frames are not supplied to OnlineTemporalCleaner.update().")
 
     try:
         for path in files:
             loop_start = time.perf_counter()
             raw = np.load(path)
-            result = processor.update(raw, dt=cp.DT)
+            # ONE update per newly received matrix.  Replay uses the dataset's
+            # nominal dt so results are reproducible; a real sensor callback
+            # should pass processor.measure_dt() instead.
+            result = processor.update(raw, dt=dt_nominal)
             latencies.append(result.tracker_latency_ms)
 
             if not args.headless:
-                canvas = renderer.render(raw, result)
+                canvas = renderer.render(raw, result, dt=dt_nominal)
                 cv2.imshow(args.window_name, canvas)
 
                 key = cv2.waitKey(1) & 0xFF
@@ -370,6 +473,7 @@ def replay_matrix_directory(args: argparse.Namespace) -> None:
                     break
                 if key == ord("r"):
                     processor.reset()
+                    renderer.reset_display_history()
                     print("tracker reset")
                 if key == ord("p"):
                     paused = not paused
@@ -382,10 +486,11 @@ def replay_matrix_directory(args: argparse.Namespace) -> None:
                         paused = False
                     elif key == ord("r"):
                         processor.reset()
+                        renderer.reset_display_history()
                         print("tracker reset")
 
             if args.realtime:
-                remaining = cp.DT - (time.perf_counter() - loop_start)
+                remaining = dt_nominal - (time.perf_counter() - loop_start)
                 if remaining > 0:
                     time.sleep(remaining)
     finally:
@@ -398,7 +503,8 @@ def replay_matrix_directory(args: argparse.Namespace) -> None:
             "tracker update latency [ms]: "
             f"mean={a.mean():.2f}, p95={np.percentile(a,95):.2f}, "
             f"p99={np.percentile(a,99):.2f}, max={a.max():.2f}; "
-            f"10-Hz budget={cp.DT*1000:.0f} ms"
+            f"budget={dt_nominal*1000:.0f} ms "
+            f"({1.0/dt_nominal:.0f} Hz)"
         )
 
 
@@ -407,6 +513,12 @@ def parse_args() -> argparse.Namespace:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--matrix-dir", type=Path, default=cp.MATRIX_DIR,
                     help="recorded matrices for live-style replay")
+    ap.add_argument("--dt", type=float, default=cp.LEGACY_DT,
+                    help="nominal seconds per frame of the replayed sequence "
+                         "(0.10 for the 10-Hz recordings in this repo, 0.05 to "
+                         "exercise the 20-Hz live configuration)")
+    ap.add_argument("--fps", type=float, default=None,
+                    help="alternative to --dt (dt = 1/fps)")
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--end", type=int, default=None)
     ap.add_argument("--ppm", type=float, default=6.0,
@@ -417,7 +529,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--no-realtime", dest="realtime", action="store_false",
                     help="replay as fast as possible instead of sleeping to 10 Hz")
     ap.set_defaults(realtime=True)
-    return ap.parse_args()
+    args = ap.parse_args()
+    if args.fps is not None:
+        args.dt = 1.0 / args.fps
+    return args
 
 
 def main() -> None:

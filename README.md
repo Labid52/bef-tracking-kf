@@ -19,6 +19,41 @@ Stabilized BEV
 
 The deployment/online mode is **causal**: each output uses only the current frame and tracker state from previous frames. Future frames are not used.
 
+## Rates
+
+| | rate | dt |
+|---|---|---|
+| **live deployment (nominal)** | **20 Hz** | **0.05 s** |
+| recorded datasets in this repo (`matrix/`, `realtime_capture/matrix`) | 10 Hz | 0.10 s |
+
+The tracker is rate-aware: `dt` is supplied per call and threaded through every
+physical computation. Time-based policies (coast duration, duplicate evidence
+window, confirmation window, ego-flow baseline) are configured in **seconds**;
+evidence-based policies (`confirm_hits`, `min_track_observations`) remain
+**observation counts**. See `README_LIVE_BEV.md` for the live loop.
+
+## Commands
+
+```bash
+# --- live, 20 Hz: see README_LIVE_BEV.md for the loop; replay the same path ---
+python3 live_bev_viewer.py --matrix-dir realtime_capture/matrix --dt 0.05
+
+# --- reprocess recorded data ---
+python3 run_temporal_cleaning.py --matrix-dir realtime_capture/matrix \
+        --mode causal  --dt 0.05 --out out_causal_20hz     # 20 Hz assumptions
+python3 run_temporal_cleaning.py --matrix-dir realtime_capture/matrix \
+        --mode causal  --dt 0.10 --out out_causal_10hz     # legacy 10 Hz
+python3 run_temporal_cleaning.py --matrix-dir realtime_capture/matrix \
+        --mode offline --dt 0.10 --out out_offline_10hz    # offline (uses future)
+
+# --- validation ---
+python3 test_tracker_regression.py                          # regression suite
+python3 compare_raw_cleaned.py --matrix-dir realtime_capture/matrix \
+        --cleaned-dir out_offline_10hz/matrix_cleaned \
+        --causal-dir  out_causal_10hz/matrix_cleaned
+```
+
+
 ---
 
 ## Input

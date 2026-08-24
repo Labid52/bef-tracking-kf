@@ -86,8 +86,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--matrix-dir", type=Path, default=DEFAULT_MATRIX_DIR)
-    ap.add_argument("--dt", type=float, default=control_params.DT,
-                    help="seconds per frame; must match the dataset rate")
+    ap.add_argument("--dt", type=float, default=None,
+                    help="seconds per frame of the INPUT sequence. Defaults to "
+                         "control_params.DT. Fully honoured: it is threaded "
+                         "through prediction, ego motion, coasting and all "
+                         "time-based policies.")
+    ap.add_argument("--fps", type=float, default=None,
+                    help="alternative to --dt (dt = 1/fps)")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT_DIR)
     ap.add_argument("--mode", choices=("offline", "causal"), default="offline",
                     help="offline uses future frames (smoothing, stitching); "
@@ -97,6 +102,14 @@ def main() -> None:
     ap.add_argument("--no-ego-motion", action="store_true",
                     help="disable yaw compensation and the infrastructure prior")
     args = ap.parse_args()
+
+    if args.dt is not None and args.fps is not None:
+        raise SystemExit("give --dt or --fps, not both")
+    dt = args.dt if args.dt is not None else (
+        1.0 / args.fps if args.fps is not None else control_params.DT)
+    if not (tmc.DT_MIN <= dt <= tmc.DT_MAX):
+        raise SystemExit(f"dt={dt} outside the supported range "
+                         f"[{tmc.DT_MIN}, {tmc.DT_MAX}] s")
 
     t0 = time.time()
     files, raw = load_matrices(args.matrix_dir)
@@ -110,8 +123,8 @@ def main() -> None:
     if args.no_ego_motion:
         cfg.use_ego_motion = False
 
-    print(f"cleaning in '{args.mode}' mode ...")
-    result = tmc.clean_sequence(raw, cfg=cfg, mode=args.mode)
+    print(f"cleaning in '{args.mode}' mode at dt={dt:.4f} s ({1.0/dt:.1f} Hz) ...")
+    result = tmc.clean_sequence(raw, cfg=cfg, mode=args.mode, dt=dt)
 
     # The original data must be provably untouched.
     if hashlib.sha256(raw.tobytes()).hexdigest() != raw_digest:
@@ -130,8 +143,6 @@ def main() -> None:
                         n_inliers=result.ego_inliers.astype(np.int16))
     (out / "config.json").write_text(cfg.to_json())
 
-    if abs(args.dt - tmc.DT) > 1e-9:
-        raise ValueError(f"--dt {args.dt} does not match the cleaner's DT {tmc.DT}")
     n_emit = sum(len(e) for e in result.emissions)
     prov_counts = {}
     for ems in result.emissions:
@@ -145,9 +156,35 @@ def main() -> None:
         "last_frame": files[-1].name,
         "mode": args.mode,
         "uses_future_frames": args.mode == "offline",
-        "fps": 1.0 / tmc.DT,
-        "dt_s": tmc.DT,
-        "duration_s": round(len(files) * tmc.DT, 2),
+        "fps": 1.0 / dt,
+        "dt_s": dt,
+        "timing": {
+            "dt_s": dt,
+            "fps": 1.0 / dt,
+            "source": ("--dt" if args.dt is not None
+                       else "--fps" if args.fps is not None
+                       else "control_params.DT default"),
+            "nominal_live_dt_s": tmc.NOMINAL_DT,
+            "legacy_recorded_dt_s": tmc.LEGACY_DT,
+            "time_based_policies_s": {
+                "max_coast_s": cfg.max_coast_s,
+                "emit_coast_s": cfg.emit_coast_s,
+                "coast_tau_s": cfg.coast_tau_s,
+                "coast_velocity_window_s": cfg.coast_velocity_window_s,
+                "confirm_window_s": cfg.confirm_window_s,
+                "duplicate_window_s": cfg.duplicate_window_s,
+                "duplicate_release_s": cfg.duplicate_release_s,
+                "ego_flow_baseline_s": cfg.ego_flow_baseline_s,
+                "stitch_max_gap_s": cfg.stitch_max_gap_s,
+            },
+            "observation_count_policies": {
+                "confirm_hits": cfg.confirm_hits,
+                "min_track_observations": cfg.min_track_observations,
+                "duplicate_min_support": cfg.duplicate_min_support,
+                "coast_velocity_min_samples": cfg.coast_velocity_min_samples,
+            },
+        },
+        "duration_s": round(len(files) * dt, 2),
         "grid": {"rows": tmc.ROWS, "cols": tmc.COLS,
                  "cell_size_m": tmc.CELL_SIZE_M,
                  "ego_row": tmc.EGO_ROW, "ego_col": tmc.EGO_COL},
