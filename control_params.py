@@ -8,15 +8,37 @@ carried their own copy of the getTargetSpeed keyword set and passed dt = 0.05
 while the dataset is 10 FPS (dt = 0.10).
 
 Nothing here redefines control policy: the policy lives in target_speed.py and
-is called unmodified.  These are the ARGUMENTS the policy is invoked with for
-this dataset.
+is called unmodified.  These are the ARGUMENTS the policy is invoked with.
+
+Note that ``dt`` inside TARGET_SPEED_KW is only carried through to
+getTargetSpeed for future closed-loop use; the present policy is distance-only,
+so it does not change the returned speed.
 """
 
 from pathlib import Path
 
-# Dataset timing.  Confirmed 10 FPS; temporal_matrix_cleaner.DT must agree.
-FPS = 10.0
-DT = 1.0 / FPS          # 0.10 s
+# ---------------------------------------------------------------------------
+# Timing.  There are two distinct rates in this project; keep them separate.
+#
+#   LIVE_FPS    the nominal rate of the deployed BEV pipeline (20 Hz).  The
+#               live tracker still receives the ACTUAL measured dt on every
+#               update -- this constant is only the nominal default.
+#   LEGACY_FPS  the rate of the recorded datasets stored in this repository
+#               (matrix/ and realtime_capture/matrix), which were captured at
+#               10 Hz.  Reprocess those with --dt 0.10.
+#
+# Nothing in the tracker reads a fixed rate: every physical computation takes dt
+# as an explicit argument, so the same code runs at either rate.
+# ---------------------------------------------------------------------------
+LIVE_FPS = 20.0
+LIVE_DT = 1.0 / LIVE_FPS        # 0.05 s -- nominal live deployment
+LEGACY_FPS = 10.0
+LEGACY_DT = 1.0 / LEGACY_FPS    # 0.10 s -- recorded datasets in this repo
+
+# Default used by the recorded-data tools in this repo (the datasets are 10 Hz).
+# Live code must pass its own measured dt instead of relying on this.
+FPS = LEGACY_FPS
+DT = LEGACY_DT
 FRAME_STEP = 1          # every matrix frame is used exactly once
 
 PROJECT_DIR = Path(__file__).resolve().parent

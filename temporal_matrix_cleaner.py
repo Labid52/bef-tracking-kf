@@ -81,7 +81,26 @@ PROVENANCES = (PROV_OBSERVED, PROV_INTERPOLATED, PROV_COASTED, PROV_PASSTHROUGH)
 ROWS, COLS = 120, 80
 EGO_ROW, EGO_COL = 80, 40
 CELL_SIZE_M = 1.0
-DT = 0.10  # seconds per frame (10 FPS)
+# Nominal frame interval.  This is ONLY a default for callers that do not supply
+# a dt; every physical computation takes dt as an explicit argument so the same
+# tracker runs at 10 Hz (recorded data) and 20 Hz (live) without change.
+NOMINAL_FPS = 20.0
+NOMINAL_DT = 1.0 / NOMINAL_FPS      # 0.05 s -- the live deployment rate
+DT = NOMINAL_DT                     # backwards-compatible alias
+LEGACY_FPS = 10.0                   # rate of the recorded datasets in this repo
+LEGACY_DT = 1.0 / LEGACY_FPS
+# Guard rails for a measured dt coming from a live clock.
+DT_MIN = 0.005                      # 200 Hz -- below this the caller is wrong
+DT_MAX = 0.50                       # a longer gap is treated as a stall
+#: The tracker clock is an accumulated float sum, so comparing it against a
+#: duration threshold needs a tolerance well below one frame but far above the
+#: accumulation error (~1e-13 after thousands of frames).
+TIME_EPS_FRAC = 1e-3
+
+
+def time_exceeds(elapsed: float, limit_s: float, dt: float) -> bool:
+    """``elapsed > limit_s``, robust to accumulated floating-point drift."""
+    return elapsed > limit_s + TIME_EPS_FRAC * dt
 
 X_MAX = float(EGO_ROW)                      # +80 m
 X_MIN = float(EGO_ROW - (ROWS - 1))         # -39 m
@@ -168,10 +187,10 @@ class CleanerConfig:
     # legitimate multi-metre range jumps this sensor produces every frame.
     gate_max_m: float = 6.0                  # radial gate at zero coast/range
     gate_range_frac: float = 0.15            # radial growth per metre of range
-    gate_grow_m_per_frame: float = 1.2       # radial growth per coasted frame
+    gate_grow_m_per_s: float = 12.0          # radial growth per coasted SECOND
     gate_tangential_m: float = 3.5           # cross-range gate at zero coast
     gate_tangential_range_frac: float = 0.06
-    gate_tangential_per_frame: float = 0.5
+    gate_tangential_per_s: float = 5.0
     class_switch_penalty: float = 2.0  # cost added for a within-group label change
 
     # --- intra-frame duplicate clustering (conservative: measured only 84 of
@@ -183,12 +202,34 @@ class CleanerConfig:
 
     # --- track lifecycle ---
     confirm_hits: int = 3              # M of N
-    confirm_window: int = 6
-    max_coast_frames: Dict[str, int] = field(default_factory=lambda: {
-        GROUP_VEHICLE: 12, GROUP_VRU: 10, GROUP_SIGN: 15,
-        GROUP_LIGHT: 15, GROUP_OTHER: 10,
+    confirm_window_s: float = 0.6      # TIME-BASED
+    # TIME-BASED (seconds).  These describe physical durations, so they are
+    # converted to frames with the actual dt and are identical at 10 and 20 Hz.
+    max_coast_s: Dict[str, float] = field(default_factory=lambda: {
+        GROUP_VEHICLE: 1.2, GROUP_VRU: 1.0, GROUP_SIGN: 1.5,
+        GROUP_LIGHT: 1.5, GROUP_OTHER: 1.0,
     })
-    emit_coast_frames: int = 8         # CAUSAL only: trailing coast still drawn.
+    # ---- coast policy (see Track.robust_velocity and Tracker.step) ----------
+    # A blind prediction is the ONLY place the diagnosed false ego-crossings
+    # occurred, so the coast is now (a) seeded from a robust recent motion
+    # estimate rather than one noisy instantaneous Kalman sample, (b) decayed
+    # toward zero relative motion, (c) time-limited, and (d) dropped once the
+    # position uncertainty says the estimate is no longer worth publishing.
+    coast_robust_velocity: bool = True
+    coast_velocity_window_s: float = 0.5   # TIME-BASED: robust-velocity window
+    coast_velocity_min_samples: int = 3    # OBSERVATION-COUNT criterion
+    coast_tau_s: float = 0.20              # TIME-BASED: velocity decay constant.
+                                           # Chosen by A/B: 0.20 s makes a blind
+                                           # prediction fade to a position HOLD
+                                           # within ~3 frames, which the
+                                           # diagnosis showed beats constant-
+                                           # velocity coasting, while still
+                                           # bridging short dropouts.
+    emit_max_pos_sigma_m: float = 8.0      # stop publishing beyond this 1-sigma.
+                                           # A backstop for runaway covariance
+                                           # only: with coast_tau_s = 0.20 the
+                                           # coast fades before this triggers.
+    emit_coast_s: float = 0.80         # CAUSAL only: trailing coast still drawn.
                                        # Offline emits nothing after the last
                                        # observation: with the future available
                                        # a gap that never closes is a genuine
@@ -208,13 +249,13 @@ class CleanerConfig:
     # lets one physical sign stay one track across the sensor's range jumps; a
     # tight tangential gate stops two objects at different bearings from being
     # glued together.
-    stitch_max_gap_frames: int = 15
+    stitch_max_gap_s: float = 1.5      # TIME-BASED
     stitch_gate_radial_m: float = 5.0
     stitch_gate_radial_frac: float = 0.15       # per metre of range
     stitch_gate_tangential_m: float = 3.5
-    stitch_gate_per_frame_m: float = 0.4
+    stitch_gate_per_s_m: float = 4.0
     stitch_min_obs: int = 2            # never stitch onto a single detection
-    merge_min_overlap_frames: int = 3
+    merge_min_overlap_s: float = 0.3   # TIME-BASED
     max_fit_rms_m: float = 2.6         # a merge or a stitch is accepted only if
                                        # the combined track still explains its
                                        # own measurements this well.  Proximity
@@ -234,11 +275,23 @@ class CleanerConfig:
         GROUP_VEHICLE: 3.0, GROUP_VRU: 3.0, GROUP_SIGN: 12.0,
         GROUP_LIGHT: 12.0, GROUP_OTHER: 3.0,
     })
-    duplicate_min_overlap_frames: int = 4
+    # Duplicate evidence is a ROLLING WINDOW, never a one-shot latch.  A pair
+    # must stay co-located for duplicate_window_s with high coverage before one
+    # of them is suppressed, and the suppression is RELEASED as soon as the pair
+    # has been demonstrably apart for duplicate_release_s.  This is the online
+    # counterpart of the offline median-over-lifetime test.
+    duplicate_window_s: float = 1.0        # TIME-BASED: evidence to suppress
+    duplicate_release_s: float = 0.4       # TIME-BASED: evidence to release
+    duplicate_coverage: float = 0.85       # fraction of the window within radius
+    duplicate_hard_release_factor: float = 2.0   # instant release beyond this x radius
+    duplicate_observe_factor: float = 3.0  # keep separation history out to this x radius
     # Coverage radius for the safety pass-through.  Deliberately TIGHTER than
     # duplicate_radius_m: sustained co-location over many frames is evidence of
     # duplication, a single-frame offset is not, so a lone far detection must
     # not be allowed to "cover" (and thereby delete) a near one.
+    # How much farther than the raw detection an emitted object may sit and
+    # still be treated as covering it (see add_safety_passthrough).
+    passthrough_farther_tolerance_m: float = 1.5
     passthrough_cover_radius_m: Dict[str, float] = field(default_factory=lambda: {
         GROUP_VEHICLE: 3.0, GROUP_VRU: 3.0, GROUP_SIGN: 6.0,
         GROUP_LIGHT: 6.0, GROUP_OTHER: 3.0,
@@ -275,6 +328,13 @@ class CleanerConfig:
         GROUP_LIGHT: 10.0, GROUP_OTHER: 15.0,
     })
     max_radial_world_speed_mps: float = 60.0
+    # Hard physical clamp on the velocity STATE (not just the plausibility
+    # annotation).  Two road vehicles closing head-on reach ~60 m/s of relative
+    # speed; nothing in this scene exceeds that.  Without the clamp a single
+    # 1 m quantisation step divided by a small dt injects an absurd velocity --
+    # at 20 Hz one cell per frame is already 20 m/s -- which then drives the
+    # next prediction.  Measured: peak |w| 118 m/s at 20 Hz before clamping.
+    max_state_speed_mps: float = 60.0
 
     # --- ego motion ---
     ego_ransac_iters: int = 80
@@ -282,19 +342,23 @@ class CleanerConfig:
     ego_min_inliers: int = 3
     ego_sigma_v_meas: float = 2.5
     ego_sigma_a: float = 1.5
-    ego_sigma_psi_meas: float = 0.08
+    # Causal-yaw responsiveness.  A/B against a yaw estimated independently
+    # from the RAW flow: the previous values reproduced only 0.34x of the true
+    # amplitude through turns (corr 0.43); these reach 0.64x (corr 0.58) without
+    # increasing lateral jitter (unexplained |dy|>2 m: 763 -> 758).
+    ego_sigma_psi_meas: float = 0.04
     # A road vehicle's yaw ACCELERATION is bounded; 0.15 rad/s^2 lets the yaw
     # rate change by 0.15 rad/s per second, which covers normal steering while
     # rejecting the per-frame spikes the finite-difference flow can produce.
-    ego_sigma_psidot: float = 0.15
+    ego_sigma_psidot: float = 0.80
     ego_causal_rate_damping: float = 0.0  # see ScalarCVFilter.__init__
     # Baseline (in frames) for the finite-difference velocity fed to the
     # ego-motion solver.  2 frames spans one full 5 Hz perception update, so the
     # measured hold-and-jump averages out instead of aliasing into the estimate.
     ego_flow_finite_difference: bool = True   # False reproduces the old
                                        # filtered-velocity behaviour (A/B only)
-    ego_flow_baseline_frames: int = 2
-    ego_flow_max_baseline_frames: int = 4
+    ego_flow_baseline_s: float = 0.20  # TIME-BASED: spans one perception update
+    ego_flow_max_baseline_s: float = 0.40
     ego_near_range_m: float = 35.0     # only points this close are used for v,
                                        # because the range bias grows with range
     ego_v_max: float = 30.0
@@ -406,16 +470,20 @@ def _rot(delta: float) -> np.ndarray:
     return np.array([[c, s], [-s, c]])
 
 
-def transition(psi: float, dt: float, damping: float = 1.0) -> np.ndarray:
+def transition(psi: float, dt: float, damping: float = 1.0,
+               speed_damping: float = 1.0) -> np.ndarray:
     """State transition F for state [x, y, wx, wy].
 
+    ``speed_damping`` < 1 shrinks the whole velocity once per step -- used only
+    while coasting, so a blind prediction fades instead of running forever.
     ``damping`` < 1 pulls w_y toward zero once per step; that is the
     stationary-infrastructure prior (see the module docstring).  It is folded
     into F so the Kalman filter, the RTS smoother and the extrapolator all use
     exactly the same model.
     """
     M = _rot(psi * dt)
-    D = np.diag([1.0, float(damping)])
+    sd = float(speed_damping)
+    D = np.diag([sd, sd * float(damping)])
     F = np.zeros((4, 4))
     F[:2, :2] = M
     F[:2, 2:] = M @ D * dt
@@ -440,7 +508,9 @@ class Track:
     __slots__ = ("tid", "group", "state", "cov", "frames", "obs_frames",
                  "obs_xy", "obs_cls", "first_frame", "last_obs_frame",
                  "hits", "misses", "confirmed", "alive", "history",
-                 "is_static", "smoothed", "plausible", "duplicate_of")
+                 "is_static", "smoothed", "plausible", "duplicate_of",
+                 "obs_times", "last_obs_time", "birth_time", "coast_started",
+                 "dup_since")
 
     def __init__(self, tid: int, frame: int, det: Detection, cfg: CleanerConfig):
         self.tid = tid
@@ -454,6 +524,11 @@ class Track:
         self.first_frame = frame
         self.last_obs_frame = frame
         self.obs_frames: List[int] = [frame]
+        self.obs_times: List[float] = [0.0]     # filled in by Tracker.step
+        self.last_obs_time = 0.0
+        self.birth_time = 0.0
+        self.coast_started = False              # coast velocity already set?
+        self.dup_since: Optional[float] = None  # when duplicate_of was set
         self.obs_xy: List[Tuple[float, float]] = [(det.x, det.y)]
         self.obs_cls: List[int] = [det.cls]
         self.hits = 1
@@ -476,9 +551,42 @@ class Track:
     def n_obs(self) -> int:
         return len(self.obs_frames)
 
+    def robust_velocity(self, now: float, window_s: float,
+                        min_samples: int) -> Optional[np.ndarray]:
+        """Median realised velocity over this track's own recent observations.
+
+        The Kalman velocity is re-estimated every update and is noisy (measured
+        median change 2.4 m/s per update on the recorded drive).  Freezing that
+        instantaneous sample is what launched tracks through the ego.  The median
+        of the recently realised displacements is far more representative and
+        uses only this track's own past measurements.
+        """
+        pts = [(t_, xy) for t_, xy in zip(self.obs_times, self.obs_xy)
+               if t_ >= now - window_s]
+        if len(pts) < min_samples:
+            return None
+        # Theil-Sen: median over ALL pairwise slopes, not just consecutive ones.
+        # Consecutive differences are useless here because the source is a 1 m
+        # raster: at 20 Hz a vehicle closing at 8 m/s moves 0.4 m per frame, so
+        # most consecutive differences are exactly zero and their median is zero.
+        # Pairwise slopes use long baselines and stay robust to outliers.
+        vx, vy = [], []
+        n = len(pts)
+        for i in range(n - 1):
+            ti, (xi, yi) = pts[i]
+            for j in range(i + 1, n):
+                span = pts[j][0] - ti
+                if span <= 1e-9:
+                    continue
+                vx.append((pts[j][1][0] - xi) / span)
+                vy.append((pts[j][1][1] - yi) / span)
+        if not vx:
+            return None
+        return np.array([float(np.median(vx)), float(np.median(vy))])
+
     def predict(self, psi: float, dt: float, sigma_a: float,
-                damping: float = 1.0) -> None:
-        F = transition(psi, dt, damping)
+                damping: float = 1.0, speed_damping: float = 1.0) -> None:
+        F = transition(psi, dt, damping, speed_damping)
         self.state = F @ self.state
         self.cov = F @ self.cov @ F.T + process_noise(sigma_a, dt)
 
@@ -499,6 +607,14 @@ class Track:
         self.state = self.state + K @ innov
         I_KH = np.eye(4) - K @ H
         self.cov = I_KH @ self.cov @ I_KH.T + K @ R @ K.T
+        self._clamp_speed(cfg)
+
+    def _clamp_speed(self, cfg: CleanerConfig) -> None:
+        """Keep the velocity state inside a physically possible range."""
+        lim = cfg.max_state_speed_mps
+        sp = float(math.hypot(self.state[2], self.state[3]))
+        if sp > lim > 0.0:
+            self.state[2:4] *= lim / sp
 
     def voted_class(self) -> int:
         """Stable label for the track.
@@ -541,7 +657,7 @@ class Track:
 
 
 def lateral_damping(group: str, cfg: CleanerConfig, yaw_compensated: bool,
-                    dt: float = DT) -> float:
+                    dt: float = NOMINAL_DT) -> float:
     """Per-step decay applied to w_y for stationary-infrastructure classes.
 
     Only valid once yaw is compensated: without it a static object seen during
@@ -583,6 +699,7 @@ class Tracker:
         self.active: List[Track] = []
         self.finished: List[Track] = []
         self._next_id = 0
+        self.time = 0.0          # accumulated seconds; the tracker's own clock
 
     @property
     def yaw_ok(self) -> bool:
@@ -596,25 +713,29 @@ class Tracker:
         return psi if np.isfinite(psi) else 0.0
 
     def step(self, frame: int, dets: Sequence[Detection],
-             dt: float = DT, psi: Optional[float] = None) -> None:
+             dt: float = NOMINAL_DT, psi: Optional[float] = None) -> None:
         """Advance the tracker by one frame.
 
         ``psi`` overrides the stored yaw-rate series; this is how a live
         pipeline injects a measured yaw rate.  ``dt`` lets the same tracker run
-        at a rate other than 10 FPS: everything below that is expressed
-        per-frame is scaled by dt/DT so behaviour at dt = DT is unchanged.
+        at any rate: every temporal policy below is expressed in SECONDS and
+        converted with the supplied dt, so a physical duration means the same
+        thing at 10 Hz and at 20 Hz.
         """
         cfg = self.cfg
+        dt = float(np.clip(dt, DT_MIN, DT_MAX))
+        self.time += dt
         if psi is None:
             psi = self._yaw(frame)
         else:
             psi = float(psi) if np.isfinite(psi) else 0.0
-        rate = dt / DT   # 1.0 for this dataset
-
         for t in self.active:
             sa = cfg.sigma_accel.get(t.group, 2.0)
-            t.predict(psi, dt, sa,
-                      lateral_damping(t.group, cfg, self.yaw_ok or psi != 0.0, dt))
+            lat = lateral_damping(t.group, cfg, self.yaw_ok or psi != 0.0, dt)
+            # Already coasting -> fade the blind velocity toward zero.
+            speed_damp = (math.exp(-dt / cfg.coast_tau_s)
+                          if (t.misses >= 1 and cfg.coast_tau_s > 0) else 1.0)
+            t.predict(psi, dt, sa, lat, speed_damp)
 
         # ---- association -------------------------------------------------
         n_t, n_d = len(self.active), len(dets)
@@ -622,12 +743,12 @@ class Tracker:
             BIG = 1e6
             cost = np.full((n_t, n_d), BIG)
             for i, t in enumerate(self.active):
-                coast = (frame - t.last_obs_frame) * rate
+                coast_s = max(0.0, self.time - t.last_obs_time)
                 rng = math.hypot(t.state[0], t.state[1])
                 gate_r = (cfg.gate_max_m + cfg.gate_range_frac * rng
-                          + cfg.gate_grow_m_per_frame * coast)
+                          + cfg.gate_grow_m_per_s * coast_s)
                 gate_t = (cfg.gate_tangential_m + cfg.gate_tangential_range_frac * rng
-                          + cfg.gate_tangential_per_frame * coast)
+                          + cfg.gate_tangential_per_s * coast_s)
                 H = np.zeros((2, 4)); H[0, 0] = 1.0; H[1, 1] = 1.0
                 R = measurement_covariance(t.state[0], t.state[1], cfg)
                 S = H @ t.cov @ H.T + R
@@ -658,9 +779,12 @@ class Tracker:
                 t = self.active[i]
                 t.update(dets[j], cfg)
                 t.obs_frames.append(frame)
+                t.obs_times.append(self.time)
                 t.obs_xy.append((dets[j].x, dets[j].y))
                 t.obs_cls.append(dets[j].cls)
                 t.last_obs_frame = frame
+                t.last_obs_time = self.time
+                t.coast_started = False
                 t.hits += 1
                 t.misses = 0
                 assigned_t.add(i)
@@ -671,12 +795,33 @@ class Tracker:
         for i, t in enumerate(self.active):
             if i not in assigned_t:
                 t.misses += 1
+                if not t.coast_started:
+                    # FIRST blind frame for this track.  The instantaneous
+                    # Kalman velocity is noisy (measured median change 2.4 m/s
+                    # per update), and freezing it is what drove tracks through
+                    # the ego.  Replace it with a robust estimate from this
+                    # track's own recent observations and undo the step that was
+                    # just taken with the noisy one.
+                    t.coast_started = True
+                    if cfg.coast_robust_velocity:
+                        rv = t.robust_velocity(t.last_obs_time,
+                                               cfg.coast_velocity_window_s,
+                                               cfg.coast_velocity_min_samples)
+                        if rv is not None:
+                            decay = (math.exp(-dt / cfg.coast_tau_s)
+                                     if cfg.coast_tau_s > 0 else 1.0)
+                            t.state[0:2] += (rv - t.state[2:4]) * dt
+                            t.state[2:4] = rv * decay
+                            t._clamp_speed(cfg)
 
         # ---- births ------------------------------------------------------
         for j, d in enumerate(dets):
             if j in assigned_d:
                 continue
             t = Track(self._next_id, frame, d, cfg)
+            t.obs_times = [self.time]
+            t.last_obs_time = self.time
+            t.birth_time = self.time
             self._next_id += 1
             self.active.append(t)
 
@@ -684,10 +829,12 @@ class Tracker:
         keep: List[Track] = []
         for t in self.active:
             if not t.confirmed:
-                window = frame - t.first_frame + 1
+                # +dt keeps the original inclusive frame-count semantics
+                # (a track born this frame has already used one frame).
+                window_s = self.time - t.birth_time + dt
                 if t.hits >= cfg.confirm_hits:
                     t.confirmed = True
-                elif window > cfg.confirm_window:
+                elif time_exceeds(window_s, cfg.confirm_window_s, dt):
                     # Never confirmed in time: let it die unless still hitting.
                     if t.misses > 0:
                         t.alive = False
@@ -695,9 +842,9 @@ class Tracker:
             t.history[frame] = (float(t.state[0]), float(t.state[1]),
                                 float(t.state[2]), float(t.state[3]), observed)
 
-            max_coast = cfg.max_coast_frames.get(t.group, 10) / max(rate, 1e-6)
+            max_coast_s = cfg.max_coast_s.get(t.group, 1.0)
             pos_sigma = math.sqrt(max(float(t.cov[0, 0] + t.cov[1, 1]), 0.0))
-            if t.misses > max_coast:
+            if time_exceeds(self.time - t.last_obs_time, max_coast_s, dt):
                 t.alive = False
             if not _inside_grid(t.state[0], t.state[1], cfg.grid_margin_m):
                 t.alive = False
@@ -737,19 +884,30 @@ class ScalarCVFilter:
         through the long measurement gaps this data has (only a minority of
         frames yield an ego solve).  1.0 is the constant-rate model the offline
         smoother uses; 0.0 degenerates to a random walk."""
-        self.dt = dt
-        d = float(rate_damping)
-        self.F = np.array([[1.0, dt * d], [0.0, d]])
-        self.Q = np.array([[dt ** 3 / 3, dt ** 2 / 2],
-                           [dt ** 2 / 2, dt]]) * sigma_rate ** 2
+        self._damp = float(rate_damping)
+        self._sigma_rate = float(sigma_rate)
         self.H = np.array([[1.0, 0.0]])
         self.R = np.array([[sigma_meas ** 2]])
+        self._rebuild(dt)
         self.x = np.array([x0, 0.0])
         self.P = np.diag([p0, p0])
         self.seeded = False
 
-    def step(self, z: Optional[float]) -> float:
-        """Advance one frame; ``z`` is None when this frame has no measurement."""
+    def _rebuild(self, dt: float) -> None:
+        self.dt = float(dt)
+        d = self._damp
+        self.F = np.array([[1.0, self.dt * d], [0.0, d]])
+        self.Q = np.array([[self.dt ** 3 / 3, self.dt ** 2 / 2],
+                           [self.dt ** 2 / 2, self.dt]]) * self._sigma_rate ** 2
+
+    def step(self, z: Optional[float], dt: Optional[float] = None) -> float:
+        """Advance one frame; ``z`` is None when this frame has no measurement.
+
+        ``dt`` overrides the construction-time interval, so the same filter stays
+        correct under a variable live frame rate.
+        """
+        if dt is not None and abs(dt - self.dt) > 1e-12:
+            self._rebuild(dt)
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
         if z is not None:
@@ -854,7 +1012,8 @@ def solve_ego_frame(points: Sequence[Tuple[float, float, float, float, float]],
     return v, psi, best_n
 
 
-def _finite_difference_velocity(t: Track, frame: int, cfg: CleanerConfig
+def _finite_difference_velocity(t: Track, frame: int, cfg: CleanerConfig,
+                                dt: float = NOMINAL_DT
                                 ) -> Optional[Tuple[float, float, float, float]]:
     """Velocity of a track at ``frame`` straight from its own observations.
 
@@ -862,7 +1021,7 @@ def _finite_difference_velocity(t: Track, frame: int, cfg: CleanerConfig
     a low-pass of exactly that signal: measured on this dataset it attenuates
     the yaw rate by ~1.8x through a turn and delays it by several frames.  So
     the solver is given a finite difference instead, over a baseline of at least
-    ego_flow_baseline_frames -- long enough to span one 5 Hz perception update
+    ego_flow_baseline_s -- long enough to span one perception update
     so the measured hold-and-jump averages out rather than aliasing.
 
     Uses only observations at or before ``frame``, so it is causal.
@@ -872,20 +1031,22 @@ def _finite_difference_velocity(t: Track, frame: int, cfg: CleanerConfig
         obs[f] = xy
     if frame not in obs:
         return None
-    for gap in range(cfg.ego_flow_baseline_frames,
-                     cfg.ego_flow_max_baseline_frames + 1):
+    lo = max(1, int(round(cfg.ego_flow_baseline_s / dt)))
+    hi = max(lo, int(round(cfg.ego_flow_max_baseline_s / dt)))
+    for gap in range(lo, hi + 1):
         f0 = frame - gap
         if f0 in obs:
             x1, y1 = obs[frame]
             x0, y0 = obs[f0]
-            span = gap * DT
+            span = gap * dt
             return (x1, y1, (x1 - x0) / span, (y1 - y0) / span)
     return None
 
 
 def ego_points_from_tracks(tracks: Sequence[Track], frame: int,
-                           cfg: CleanerConfig,
-                           causal: bool) -> List[Tuple[float, float, float, float, float]]:
+                           cfg: CleanerConfig, causal: bool,
+                           dt: float = NOMINAL_DT
+                           ) -> List[Tuple[float, float, float, float, float]]:
     """Velocity field at ``frame`` from a bootstrap tracker's tracks.
 
     Prefers finite-difference velocities (see _finite_difference_velocity); the
@@ -910,7 +1071,7 @@ def ego_points_from_tracks(tracks: Sequence[Track], frame: int,
         # the ego and would bias v low.
         infra = 1.0 if t.group in cfg.static_prior_groups else 0.0
         kf_pts.append((h[0], h[1], h[2], h[3], infra))
-        fd = (_finite_difference_velocity(t, frame, cfg)
+        fd = (_finite_difference_velocity(t, frame, cfg, dt)
               if cfg.ego_flow_finite_difference else None)
         if fd is not None:
             fd_pts.append((fd[0], fd[1], fd[2], fd[3], infra))
@@ -918,8 +1079,9 @@ def ego_points_from_tracks(tracks: Sequence[Track], frame: int,
 
 
 def estimate_ego_motion(tracks: Sequence[Track], n_frames: int,
-                        cfg: CleanerConfig,
-                        causal: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                        cfg: CleanerConfig, causal: bool = False,
+                        dt: float = NOMINAL_DT
+                        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Offline batch ego-motion estimate: per-frame solve, then RTS smoothing.
 
     In the bootstrap pass ego motion is zero, so each track's (wx, wy) is the
@@ -931,7 +1093,7 @@ def estimate_ego_motion(tracks: Sequence[Track], n_frames: int,
     rs = np.random.RandomState(0)   # deterministic
 
     for f in range(n_frames):
-        r = solve_ego_frame(ego_points_from_tracks(tracks, f, cfg, causal), cfg, rs)
+        r = solve_ego_frame(ego_points_from_tracks(tracks, f, cfg, causal, dt), cfg, rs)
         if r is None:
             continue
         v_raw[f], psi_raw[f], n_in[f] = r
@@ -943,10 +1105,10 @@ def estimate_ego_motion(tracks: Sequence[Track], n_frames: int,
     v_fill = np.where(valid, v_raw, 0.0)
     psi_fill = np.where(valid, psi_raw, 0.0)
     v_s = _rts_smooth_1d(v_fill, valid, cfg.ego_sigma_v_meas,
-                         cfg.ego_sigma_a, DT,
+                         cfg.ego_sigma_a, dt,
                          x0=float(np.nanmedian(v_raw[valid])))
     psi_s = _rts_smooth_1d(psi_fill, valid, cfg.ego_sigma_psi_meas,
-                           cfg.ego_sigma_psidot, DT, x0=0.0)
+                           cfg.ego_sigma_psidot, dt, x0=0.0)
     v_s = np.clip(v_s, 0.0, cfg.ego_v_max)
     psi_s = np.clip(psi_s, -cfg.ego_psi_max, cfg.ego_psi_max)
     return v_s, psi_s, n_in
@@ -957,7 +1119,7 @@ def estimate_ego_motion(tracks: Sequence[Track], n_frames: int,
 # ---------------------------------------------------------------------------
 
 def _refilter(track: Track, cfg: CleanerConfig, ego_psi: np.ndarray,
-              yaw_ok: bool = True) -> Track:
+              yaw_ok: bool = True, dt: float = NOMINAL_DT) -> Track:
     """Re-run the Kalman filter and the RTS smoother over a track's observations.
 
     Called after any operation that changes the observation list (stitching,
@@ -970,7 +1132,7 @@ def _refilter(track: Track, cfg: CleanerConfig, ego_psi: np.ndarray,
     f0, f1 = min(obs), max(obs)
 
     sa = cfg.sigma_accel.get(track.group, 2.0)
-    damp = lateral_damping(track.group, cfg, yaw_ok)
+    damp = lateral_damping(track.group, cfg, yaw_ok, dt)
 
     x = np.array([obs[f0][0][0], obs[f0][0][1], 0.0, 0.0])
     P = np.diag([cfg.sigma_range_m ** 2, cfg.sigma_tangential_m ** 2,
@@ -987,8 +1149,8 @@ def _refilter(track: Track, cfg: CleanerConfig, ego_psi: np.ndarray,
         if k == 0:
             F = np.eye(4); Q = np.zeros((4, 4))
         else:
-            F = transition(psi, DT, damp)
-            Q = process_noise(sa, DT)
+            F = transition(psi, dt, damp)
+            Q = process_noise(sa, dt)
         x = F @ x
         P = F @ P @ F.T + Q
         Fs[k] = F
@@ -1029,7 +1191,8 @@ def _refilter(track: Track, cfg: CleanerConfig, ego_psi: np.ndarray,
 
 def _extrapolate(track: Track, frame: int, ego_psi: np.ndarray,
                  cfg: CleanerConfig, yaw_ok: bool = True,
-                 max_steps: int = 60) -> Optional[Tuple[float, float]]:
+                 max_steps: int = 60, dt: float = NOMINAL_DT
+                 ) -> Optional[Tuple[float, float]]:
     """Propagate a smoothed track state to a frame outside its observed span."""
     if not track.smoothed:
         return None
@@ -1038,12 +1201,12 @@ def _extrapolate(track: Track, frame: int, ego_psi: np.ndarray,
         s = track.smoothed[frame]
         return (s[0], s[1])
     anchor, step = (fs[0], -1) if frame < fs[0] else (fs[-1], 1)
-    damp = lateral_damping(track.group, cfg, yaw_ok)
+    damp = lateral_damping(track.group, cfg, yaw_ok, dt)
     x = np.array(track.smoothed[anchor])
     f = anchor
     while f != frame and abs(f - anchor) < max_steps:
         psi = float(ego_psi[min(max(f, 0), len(ego_psi) - 1)]) if yaw_ok else 0.0
-        x = transition(psi, DT * step, damp if step > 0 else 1.0) @ x
+        x = transition(psi, dt * step, damp if step > 0 else 1.0) @ x
         f += step
     return (float(x[0]), float(x[1]))
 
@@ -1058,7 +1221,7 @@ def _fit_rms(track: Track) -> float:
 
 
 def _try_combine(a: Track, b: Track, cfg: CleanerConfig, ego_psi: np.ndarray,
-                 yaw_ok: bool) -> bool:
+                 yaw_ok: bool, dt: float = NOMINAL_DT) -> bool:
     """Tentatively fold b into a; keep it only if the combined fit stays good.
 
     This is the hypothesis test that separates "one object seen twice" from
@@ -1076,7 +1239,7 @@ def _try_combine(a: Track, b: Track, cfg: CleanerConfig, ego_psi: np.ndarray,
     a.obs_xy = [xy[k] for k in order]
     a.obs_cls = [cls[k] for k in order]
     a.hits = len(a.obs_frames)
-    _refilter(a, cfg, ego_psi, yaw_ok)
+    _refilter(a, cfg, ego_psi, yaw_ok, dt)
 
     rms_after = _fit_rms(a)
     ok = (rms_after <= cfg.max_fit_rms_m
@@ -1088,11 +1251,12 @@ def _try_combine(a: Track, b: Track, cfg: CleanerConfig, ego_psi: np.ndarray,
 
 
 def merge_duplicate_tracks(tracks: List[Track], cfg: CleanerConfig,
-                           ego_psi: np.ndarray, yaw_ok: bool = True) -> List[Track]:
+                           ego_psi: np.ndarray, yaw_ok: bool = True,
+                           dt: float = NOMINAL_DT) -> List[Track]:
     """Merge tracks that are two views of one physical object.
 
     Two tracks are merged when they belong to the same class group, coexist for
-    at least ``merge_min_overlap_frames`` frames, and stay within a
+    at least ``merge_min_overlap_s`` seconds, and stay within a
     group-specific radius throughout.  For static groups (signs, lights) the
     radius is larger because the measured duplicate separation is 3-8 m while
     genuine opposite-corner sign pairs are ~35 m apart.
@@ -1115,7 +1279,7 @@ def merge_duplicate_tracks(tracks: List[Track], cfg: CleanerConfig,
                     continue
                 fa = set(a.smoothed); fb = set(b.smoothed)
                 common = sorted(fa & fb)
-                if len(common) < cfg.merge_min_overlap_frames:
+                if len(common) * dt < cfg.merge_min_overlap_s:
                     continue
                 d = [math.hypot(a.smoothed[f][0] - b.smoothed[f][0],
                                 a.smoothed[f][1] - b.smoothed[f][1])
@@ -1123,7 +1287,7 @@ def merge_duplicate_tracks(tracks: List[Track], cfg: CleanerConfig,
                 rad = cfg.merge_radius_m.get(a.group, 3.0)
                 if float(np.median(d)) > rad or float(np.percentile(d, 90)) > rad * 1.6:
                     continue
-                if _try_combine(a, b, cfg, ego_psi, yaw_ok):
+                if _try_combine(a, b, cfg, ego_psi, yaw_ok, dt):
                     merged_into[b.tid] = a.tid
                     changed = True
         if merged_into:
@@ -1132,7 +1296,8 @@ def merge_duplicate_tracks(tracks: List[Track], cfg: CleanerConfig,
 
 
 def stitch_tracklets(tracks: List[Track], cfg: CleanerConfig,
-                     ego_psi: np.ndarray, yaw_ok: bool = True) -> List[Track]:
+                     ego_psi: np.ndarray, yaw_ok: bool = True,
+                     dt: float = NOMINAL_DT) -> List[Track]:
     """Link a dying tracklet to a later one that is the same physical object.
 
     OFFLINE ONLY: it needs frames after the tracklet ended.  This is what
@@ -1152,22 +1317,22 @@ def stitch_tracklets(tracks: List[Track], cfg: CleanerConfig,
                 continue
             b_start = min(b.smoothed)
             gap = b_start - a_end
-            if gap <= 0 or gap > cfg.stitch_max_gap_frames:
+            if gap <= 0 or gap * dt > cfg.stitch_max_gap_s:
                 continue
-            pred = _extrapolate(a, b_start, ego_psi, cfg, yaw_ok)
-            back = _extrapolate(b, a_end, ego_psi, cfg, yaw_ok)
+            pred = _extrapolate(a, b_start, ego_psi, cfg, yaw_ok, dt=dt)
+            back = _extrapolate(b, a_end, ego_psi, cfg, yaw_ok, dt=dt)
             if pred is None or back is None:
                 continue
             e1 = _radial_tangential_error(pred, b.smoothed[b_start][:2])
             e2 = _radial_tangential_error(back, a.smoothed[a_end][:2])
             r_ref = 0.5 * (math.hypot(*pred) + math.hypot(*back))
             gate_r = (cfg.stitch_gate_radial_m + cfg.stitch_gate_radial_frac * r_ref
-                      + cfg.stitch_gate_per_frame_m * gap)
-            gate_t = cfg.stitch_gate_tangential_m + 0.3 * gap
+                      + cfg.stitch_gate_per_s_m * gap * dt)
+            gate_t = cfg.stitch_gate_tangential_m + 3.0 * gap * dt
             if max(e1[0], e2[0]) > gate_r or max(e1[1], e2[1]) > gate_t:
                 continue
             cost[i, j] = (max(e1[0], e2[0]) / gate_r
-                          + 2.0 * max(e1[1], e2[1]) / gate_t + 0.02 * gap)
+                          + 2.0 * max(e1[1], e2[1]) / gate_t + 0.2 * gap * dt)
 
     rows, colsx = linear_sum_assignment(cost)
     link: Dict[int, int] = {}
@@ -1183,7 +1348,7 @@ def stitch_tracklets(tracks: List[Track], cfg: CleanerConfig,
         a = ends[i]
         j = link.get(i)
         while j is not None and j not in absorbed and j != i:
-            if not _try_combine(a, ends[j], cfg, ego_psi, yaw_ok):
+            if not _try_combine(a, ends[j], cfg, ego_psi, yaw_ok, dt):
                 break
             absorbed.add(j)
             j = link.get(j)
@@ -1192,7 +1357,8 @@ def stitch_tracklets(tracks: List[Track], cfg: CleanerConfig,
     return sorted(kept + short, key=lambda t: (t.first_frame, t.tid))
 
 
-def suppress_duplicates(tracks: Sequence[Track], cfg: CleanerConfig) -> None:
+def suppress_duplicates(tracks: Sequence[Track], cfg: CleanerConfig,
+                        dt: float = NOMINAL_DT) -> None:
     """Flag tracks that are a redundant second view of a better-supported one.
 
     Runs after merging, so it only sees pairs the likelihood test refused to
@@ -1212,7 +1378,7 @@ def suppress_duplicates(tracks: Sequence[Track], cfg: CleanerConfig) -> None:
                     or a.n_obs >= cfg.duplicate_support_ratio * b.n_obs):
                 continue
             common = sorted(set(a.smoothed) & set(b.smoothed))
-            if len(common) < cfg.duplicate_min_overlap_frames:
+            if len(common) * dt < cfg.duplicate_window_s:
                 continue
             d = [math.hypot(a.smoothed[f][0] - b.smoothed[f][0],
                             a.smoothed[f][1] - b.smoothed[f][1]) for f in common]
@@ -1278,12 +1444,13 @@ def build_emissions(tracks: Sequence[Track], n_frames: int,
                     cfg: CleanerConfig,
                     ego_psi: Optional[np.ndarray] = None,
                     causal: bool = False,
-                    yaw_ok: bool = True) -> List[List[dict]]:
+                    yaw_ok: bool = True,
+                    dt: float = NOMINAL_DT) -> List[List[dict]]:
     """Decide, per frame, which tracks are written out and where.
 
     Asymmetric by design:
       * a CONFIRMED track is emitted over its whole observed span plus up to
-        ``emit_coast_frames`` afterwards -- this is what repairs dropouts;
+        ``emit_coast_s`` afterwards -- this is what repairs dropouts;
       * an UNCONFIRMED track is emitted only on frames where it actually has a
         detection AND that detection lies in the control-relevant safety zone
         -- so a pedestrian appearing 8 m ahead is never delayed, while far
@@ -1305,13 +1472,13 @@ def build_emissions(tracks: Sequence[Track], n_frames: int,
             continue
         obs = set(t.obs_frames)
         f_first, f_last = min(t.smoothed), max(t.smoothed)
-        trail = cfg.emit_coast_frames if causal else 0
+        trail = int(round(cfg.emit_coast_s / dt)) if causal else 0
         f_stop = min(n_frames - 1, f_last + trail)
         for f in range(f_first, f_stop + 1):
             if f in t.smoothed:
                 x, y, wx, wy = t.smoothed[f]
             else:
-                p = _extrapolate(t, f, ego_psi, cfg, yaw_ok)
+                p = _extrapolate(t, f, ego_psi, cfg, yaw_ok, dt=dt)
                 if p is None:
                     continue
                 x, y = p
@@ -1365,9 +1532,17 @@ def add_safety_passthrough(emissions: List[List[dict]],
         for d in dets:
             if not _in_safety_zone(d.x, d.y, d.cls, cfg):
                 continue
+            # A detection counts as already covered only by an emitted object
+            # of the same group that is close AND not significantly FARTHER from
+            # the ego.  A counterpart further away commands less braking, so it
+            # cannot stand in for control-relevant evidence -- and letting it do
+            # so made the pass-through flicker on and off across the radius
+            # boundary, which showed up as an oscillating target speed.
             rad = cfg.passthrough_cover_radius_m.get(d.group, 3.0)
             if any(e["group"] == d.group
-                   and math.hypot(e["x"] - d.x, e["y"] - d.y) <= rad for e in ems):
+                   and math.hypot(e["x"] - d.x, e["y"] - d.y) <= rad
+                   and e["x"] <= d.x + cfg.passthrough_farther_tolerance_m
+                   for e in ems):
                 continue
             row = EGO_ROW - int(round(d.x))
             col = EGO_COL + int(round(d.y))
@@ -1436,10 +1611,10 @@ class OnlineTemporalCleaner:
     ==========================  ==================================================
     RTS backward smoothing      the forward Kalman posterior (lags by ~1 frame,
                                 and cannot un-see an outlier it already absorbed)
-    interior-gap interpolation  forward coasting for up to emit_coast_frames;
+    interior-gap interpolation  forward coasting for up to emit_coast_s;
                                 the gap is filled as it happens, not afterwards
     tracklet stitching          the coasting budget plus the anisotropic gate;
-                                gaps longer than max_coast_frames start a new
+                                gaps longer than max_coast_s start a new
                                 track and identity is lost
     retroactive track start     M-of-N confirmation (a track outside the control
                                 region appears min_track_observations frames
@@ -1463,10 +1638,10 @@ class OnlineTemporalCleaner:
         self._main = Tracker(self.cfg)
         self._rs = np.random.RandomState(0)          # deterministic
         self._psi_filt = ScalarCVFilter(self.cfg.ego_sigma_psi_meas,
-                                        self.cfg.ego_sigma_psidot, DT,
+                                        self.cfg.ego_sigma_psidot, NOMINAL_DT,
                                         rate_damping=self.cfg.ego_causal_rate_damping)
         self._v_filt = ScalarCVFilter(self.cfg.ego_sigma_v_meas,
-                                      self.cfg.ego_sigma_a, DT,
+                                      self.cfg.ego_sigma_a, NOMINAL_DT,
                                       rate_damping=self.cfg.ego_causal_rate_damping)
         self.frame = -1
         self.ego_speed_mps = 0.0
@@ -1474,7 +1649,7 @@ class OnlineTemporalCleaner:
         self._ego_seeded = False
         self._wy_hist: Dict[int, List[float]] = {}   # |w_y| at observed frames
         self._wx_hist: Dict[int, List[float]] = {}
-        self._pair_run: Dict[Tuple[int, int], int] = {}
+        self._pair_hist: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
         self.n_restored = 0
 
     # -- ego motion ------------------------------------------------------
@@ -1492,13 +1667,14 @@ class OnlineTemporalCleaner:
         # Bootstrap tracker runs with zero ego input, so its (wx, wy) is the raw
         # ego-relative velocity field the static-point model needs.
         self._boot.step(self.frame, dets, dt)
-        pts = ego_points_from_tracks(self._boot.active, self.frame, cfg, causal=True)
+        pts = ego_points_from_tracks(self._boot.active, self.frame, cfg,
+                                     causal=True, dt=dt)
         r = solve_ego_frame(pts, cfg, self._rs)
         z_v = z_psi = None
         if r is not None and r[2] >= cfg.ego_min_inliers:
             z_v, z_psi = r[0], r[1]
-        self.ego_speed_mps = self._v_filt.step(z_v)
-        self.ego_yaw_rate = self._psi_filt.step(z_psi)
+        self.ego_speed_mps = self._v_filt.step(z_v, dt)
+        self.ego_yaw_rate = self._psi_filt.step(z_psi, dt)
         self.ego_speed_mps = float(np.clip(self.ego_speed_mps, 0.0, cfg.ego_v_max))
         self.ego_yaw_rate = float(np.clip(self.ego_yaw_rate,
                                           -cfg.ego_psi_max, cfg.ego_psi_max))
@@ -1519,32 +1695,78 @@ class OnlineTemporalCleaner:
                                    <= cfg.max_radial_world_speed_mps)
             t.is_static = (t.group in cfg.static_prior_groups)
 
-    def _update_duplicates(self) -> None:
-        """Accumulate co-location evidence and flag redundant tracks.
+    def _update_duplicates(self, dt: float) -> None:
+        """Maintain a REVOCABLE, evidence-based duplicate state per track pair.
 
-        Same rule as the offline pass, but the evidence is a RUNNING counter of
-        consecutive frames two tracks have stayed close, so the decision uses
-        only what has already happened.  Once flagged, a track stays flagged.
+        The previous implementation latched ``duplicate_of`` after 4 consecutive
+        frames within the radius and never cleared it.  Measured on the recorded
+        drive that suppressed 23.9% of vehicle tracks, 70% of which had by then
+        separated well beyond the radius, and the suppressed tracks kept winning
+        detections while never being emitted -- an invisible detection sink.
+
+        The policy here keeps a rolling window of pairwise separations:
+
+          SUPPRESS  when the pair has been co-located for duplicate_window_s
+                    with at least duplicate_coverage of samples inside the
+                    radius, AND one track is clearly better supported.
+          RELEASE   when the most recent duplicate_release_s of samples has a
+                    median separation beyond the radius, or immediately once the
+                    pair is more than duplicate_hard_release_factor x radius
+                    apart -- at that point they are unambiguously two objects.
+
+        Both decisions use only past samples, so the rule stays causal.
         """
         cfg = self.cfg
-        live = set()
-        act = [t for t in self._main.active if t.duplicate_of is None]
+        now = self._main.time
+        act = list(self._main.active)
+        by_tid = {t.tid: t for t in act}
+        seen = set()
+
         for i, a in enumerate(act):
             for b in act[i + 1:]:
                 if a.group != b.group:
                     continue
                 rad = cfg.duplicate_radius_m.get(a.group, 3.0)
-                if math.hypot(a.state[0] - b.state[0], a.state[1] - b.state[1]) > rad:
+                sep = math.hypot(a.state[0] - b.state[0], a.state[1] - b.state[1])
+                linked = (a.duplicate_of == b.tid) or (b.duplicate_of == a.tid)
+                if sep > rad * cfg.duplicate_observe_factor and not linked:
                     continue
                 key = (min(a.tid, b.tid), max(a.tid, b.tid))
-                live.add(key)
-                run = self._pair_run.get(key, 0) + 1
-                self._pair_run[key] = run
-                if run < cfg.duplicate_min_overlap_frames:
+                seen.add(key)
+                hist = self._pair_hist.setdefault(key, [])
+                hist.append((now, sep))
+                cut = now - max(cfg.duplicate_window_s, cfg.duplicate_release_s) - dt
+                while hist and hist[0][0] < cut:
+                    hist.pop(0)
+
+                # ---- release an existing suppression ----
+                if linked:
+                    drop = a if a.duplicate_of == b.tid else b
+                    if sep > rad * cfg.duplicate_hard_release_factor:
+                        drop.duplicate_of = None
+                        drop.dup_since = None
+                        continue
+                    rec = [d for (t_, d) in hist if t_ >= now - cfg.duplicate_release_s]
+                    if (len(rec) >= 2
+                            and hist[-1][0] - hist[0][0] >= cfg.duplicate_release_s - dt
+                            and float(np.median(rec)) > rad):
+                        drop.duplicate_of = None
+                        drop.dup_since = None
+                    continue
+
+                # ---- consider a new suppression ----
+                if a.duplicate_of is not None or b.duplicate_of is not None:
+                    continue
+                span = hist[-1][0] - hist[0][0]
+                if span < cfg.duplicate_window_s - dt or len(hist) < 3:
+                    continue
+                seps = [d for (_t, d) in hist]
+                coverage = float(np.mean([d <= rad for d in seps]))
+                if float(np.median(seps)) > rad or coverage < cfg.duplicate_coverage:
                     continue
                 keep, drop = (a, b) if a.n_obs > b.n_obs else (b, a)
                 if a.n_obs == b.n_obs:
-                    # Tie: keep the nearer track, the conservative choice for
+                    # Tie: keep the nearer track -- the conservative choice for
                     # the target-speed policy.
                     ra = math.hypot(a.state[0], a.state[1])
                     rb = math.hypot(b.state[0], b.state[1])
@@ -1552,12 +1774,23 @@ class OnlineTemporalCleaner:
                 if (keep.n_obs >= cfg.duplicate_min_support
                         or keep.n_obs >= cfg.duplicate_support_ratio * drop.n_obs):
                     drop.duplicate_of = keep.tid
-        for key in list(self._pair_run):
-            if key not in live:
-                del self._pair_run[key]
+                    drop.dup_since = now
+
+        # Drop history for pairs no longer under observation.
+        for key in [k for k in self._pair_hist if k not in seen]:
+            del self._pair_hist[key]
+        # A suppression whose keeper has died or itself become a duplicate is
+        # meaningless; clear it so the track can be seen again.
+        for t in act:
+            if t.duplicate_of is None:
+                continue
+            k = by_tid.get(t.duplicate_of)
+            if k is None or k.duplicate_of is not None:
+                t.duplicate_of = None
+                t.dup_since = None
 
     # -- main entry point -------------------------------------------------
-    def update(self, matrix: np.ndarray, dt: float = DT,
+    def update(self, matrix: np.ndarray, dt: float = NOMINAL_DT,
                ego_yaw_rate: Optional[float] = None,
                ego_speed_mps: Optional[float] = None
                ) -> Tuple[np.ndarray, List[dict]]:
@@ -1584,7 +1817,7 @@ class OnlineTemporalCleaner:
         psi = self._update_ego(dets, dt, ego_yaw_rate, ego_speed_mps)
         self._main.step(f, dets, dt, psi=psi)
         self._update_track_stats()
-        self._update_duplicates()
+        self._update_duplicates(dt)
 
         # ---- emission: established tracks, coasted up to the emit budget ----
         ems: List[dict] = []
@@ -1593,9 +1826,15 @@ class OnlineTemporalCleaner:
                            and t.n_obs >= cfg.min_track_observations)
             if not established:
                 continue
-            coast = f - t.last_obs_frame
-            if coast > cfg.emit_coast_frames:
+            coast_s = self._main.time - t.last_obs_time
+            if time_exceeds(coast_s, cfg.emit_coast_s, dt):
                 continue
+            # Prediction confidence decreases monotonically while coasting; stop
+            # publishing once the position is no longer worth trusting.
+            if coast_s > 0.0:
+                pos_sigma = math.sqrt(max(float(t.cov[0, 0] + t.cov[1, 1]), 0.0))
+                if pos_sigma > cfg.emit_max_pos_sigma_m:
+                    continue
             x, y = float(t.state[0]), float(t.state[1])
             row = EGO_ROW - int(round(x))
             col = EGO_COL + int(round(y))
@@ -1603,9 +1842,10 @@ class OnlineTemporalCleaner:
                 continue
             ems.append(dict(tid=t.tid, cls=t.class_at(f), x=x, y=y,
                             wx=float(t.state[2]), wy=float(t.state[3]),
-                            row=row, col=col, observed=(coast == 0),
+                            row=row, col=col, observed=(t.last_obs_frame == f),
                             static=t.is_static, group=t.group, n_obs=t.n_obs,
-                            provenance=PROV_OBSERVED if coast == 0 else PROV_COASTED))
+                            provenance=(PROV_OBSERVED if t.last_obs_frame == f
+                                        else PROV_COASTED)))
 
         wrapped = [ems]
         self.n_restored += add_safety_passthrough(wrapped, [dets], cfg)
@@ -1634,7 +1874,8 @@ class CleanResult:
 def clean_sequence(matrices: Sequence[np.ndarray],
                    cfg: Optional[CleanerConfig] = None,
                    mode: str = "offline",
-                   verbose: bool = True) -> CleanResult:
+                   verbose: bool = True,
+                   dt: float = NOMINAL_DT) -> CleanResult:
     """Clean a whole sequence.
 
     mode="offline"  : uses future frames (RTS smoothing, tracklet stitching,
@@ -1650,25 +1891,28 @@ def clean_sequence(matrices: Sequence[np.ndarray],
         cfg = CleanerConfig()
     if mode not in ("offline", "causal"):
         raise ValueError("mode must be 'offline' or 'causal'")
+    if not (DT_MIN <= dt <= DT_MAX):
+        raise ValueError(f"dt={dt} outside [{DT_MIN}, {DT_MAX}] s")
 
     n_frames = len(matrices)
 
     if mode == "causal":
-        return _clean_causal(matrices, cfg, verbose)
+        return _clean_causal(matrices, cfg, verbose, dt)
 
     dets_per_frame = [extract_detections(m, cfg) for m in matrices]
 
     # --- pass 1: bootstrap tracker with no ego-motion input ----------------
     boot = Tracker(CleanerConfig(**{**asdict(cfg), "use_ego_motion": False}))
     for f in range(n_frames):
-        boot.step(f, dets_per_frame[f])
+        boot.step(f, dets_per_frame[f], dt)
     boot_tracks = boot.finish()
     if verbose:
         print(f"  [pass 1] bootstrap tracks: {len(boot_tracks)}")
 
     # --- pass 2: ego motion -------------------------------------------------
     if cfg.use_ego_motion:
-        ego_v, ego_psi, ego_in = estimate_ego_motion(boot_tracks, n_frames, cfg)
+        ego_v, ego_psi, ego_in = estimate_ego_motion(boot_tracks, n_frames, cfg,
+                                                     dt=dt)
     else:
         ego_v = np.zeros(n_frames); ego_psi = np.zeros(n_frames)
         ego_in = np.zeros(n_frames, dtype=int)
@@ -1683,20 +1927,20 @@ def clean_sequence(matrices: Sequence[np.ndarray],
     trk = Tracker(cfg, ego_v, ego_psi)
     yaw_ok = trk.yaw_ok
     for f in range(n_frames):
-        trk.step(f, dets_per_frame[f])
+        trk.step(f, dets_per_frame[f], dt)
     tracks = trk.finish()
     if verbose:
         print(f"  [pass 3] tracks: {len(tracks)}")
 
     # --- pass 4: offline-only refinement ------------------------------------
     for t in tracks:
-        _refilter(t, cfg, ego_psi, yaw_ok)
-    tracks = stitch_tracklets(tracks, cfg, ego_psi, yaw_ok)
-    tracks = merge_duplicate_tracks(tracks, cfg, ego_psi, yaw_ok)
+        _refilter(t, cfg, ego_psi, yaw_ok, dt)
+    tracks = stitch_tracklets(tracks, cfg, ego_psi, yaw_ok, dt)
+    tracks = merge_duplicate_tracks(tracks, cfg, ego_psi, yaw_ok, dt)
     for t in tracks:
-        _refilter(t, cfg, ego_psi, yaw_ok)
+        _refilter(t, cfg, ego_psi, yaw_ok, dt)
     flag_plausibility(tracks, cfg)
-    suppress_duplicates(tracks, cfg)
+    suppress_duplicates(tracks, cfg, dt)
     classify_static(tracks, cfg, ego_v)
     if verbose:
         print(f"  [pass 4] after stitch+merge: {len(tracks)} tracks "
@@ -1705,7 +1949,7 @@ def clean_sequence(matrices: Sequence[np.ndarray],
               f"{sum(1 for t in tracks if t.duplicate_of is not None)} duplicate)")
 
     emissions = build_emissions(tracks, n_frames, cfg, ego_psi,
-                                causal=False, yaw_ok=yaw_ok)
+                                causal=False, yaw_ok=yaw_ok, dt=dt)
     restored = add_safety_passthrough(emissions, dets_per_frame, cfg)
     if verbose:
         print(f"  [safety] restored {restored} control-relevant detections "
@@ -1718,7 +1962,7 @@ def clean_sequence(matrices: Sequence[np.ndarray],
 
 
 def _clean_causal(matrices: Sequence[np.ndarray], cfg: CleanerConfig,
-                  verbose: bool) -> CleanResult:
+                  verbose: bool, dt: float = NOMINAL_DT) -> CleanResult:
     """Batch wrapper that simply streams the frames through the online cleaner."""
     n_frames = len(matrices)
     online = OnlineTemporalCleaner(cfg)
@@ -1727,7 +1971,7 @@ def _clean_causal(matrices: Sequence[np.ndarray], cfg: CleanerConfig,
     ego_v = np.zeros(n_frames)
     ego_psi = np.zeros(n_frames)
     for f, m in enumerate(matrices):
-        cleaned[f], ems = online.update(m, dt=DT)
+        cleaned[f], ems = online.update(m, dt=dt)
         emissions.append(ems)
         ego_v[f] = online.ego_speed_mps
         ego_psi[f] = online.ego_yaw_rate

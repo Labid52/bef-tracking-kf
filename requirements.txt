@@ -1,0 +1,5 @@
+# Minimal runtime dependencies for the standalone real-time application.
+# These NumPy/SciPy ranges avoid the compatibility warning seen in the lab image.
+numpy>=1.21.6,<1.25
+scipy>=1.8,<1.11
+opencv-python>=4.5,<5

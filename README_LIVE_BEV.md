@@ -23,6 +23,64 @@ camera / perception
 
 There is no RTS backward smoothing, future interpolation, or future tracklet stitching in this live path.
 
+## Rates: 20 Hz live, 10 Hz recorded
+
+| | rate | dt | where |
+|---|---|---|---|
+| **live deployment (nominal)** | **20 Hz** | **0.05 s** | `control_params.LIVE_DT`, `temporal_matrix_cleaner.NOMINAL_DT` |
+| recorded datasets in this repo | 10 Hz | 0.10 s | `control_params.LEGACY_DT`; pass `--dt 0.10` |
+
+The tracker is **rate-aware**: nothing reads a fixed frame interval. Every physical
+quantity (prediction, process noise, ego-motion flow baseline, coast duration,
+duplicate evidence windows, confirmation window) is computed from the `dt` you
+supply, so the same code and the same parameters mean the same *physical* thing
+at either rate. Policies that are genuinely about elapsed time are configured in
+**seconds**; policies that are about *evidence* (how many detections a track has
+seen) remain **observation counts**.
+
+## Minimal live loop
+
+```python
+import time
+from temporal_matrix_cleaner import OnlineTemporalCleaner
+from target_speed import getTargetSpeed
+import control_params as cp
+
+cleaner = OnlineTemporalCleaner()      # ONCE, at process start
+previous = time.monotonic()
+
+while running:
+    matrix = get_new_bev_matrix()      # one new 120x80 uint8 matrix
+
+    now = time.monotonic()
+    dt = now - previous                # ACTUAL interval, not a constant
+    previous = now
+
+    cleaned, objects = cleaner.update(matrix, dt=dt)
+
+    speed = getTargetSpeed(matrix=cleaned, **cp.TARGET_SPEED_KW)
+```
+
+If the vehicle publishes a yaw rate, pass it and the internal estimator is skipped:
+
+```python
+cleaned, objects = cleaner.update(matrix, dt=dt, ego_yaw_rate=imu_yaw_rate)
+```
+
+**Abnormal `dt` policy.** A measured `dt` outside
+`[temporal_matrix_cleaner.DT_MIN, DT_MAX]` = `[0.005, 0.5]` s is clamped into that
+range. This is deliberate: a multi-second scheduling stall must not become
+multiple seconds of blind extrapolation. `LiveBEVProcessor` counts these in
+`dt_clamped`. After a stall the affected tracks simply age out through the normal
+coast policy.
+
+**One update per frame.** Call `update()` exactly once per newly received matrix.
+Never re-feed a matrix, and never feed a future one.
+
+**Visualization must not gate tracking.** `LiveBEVProcessor.update()` (control
+path) is separate from `BEVRenderer.render()` (display). Run the renderer on the
+latest snapshot, or skip it entirely under load; the tracker state is unaffected.
+
 ## Files
 
 Add this file to the same project directory as `temporal_matrix_cleaner.py`:
