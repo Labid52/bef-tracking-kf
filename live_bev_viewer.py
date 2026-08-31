@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import math
 from pathlib import Path
 import time
 from typing import List, Optional, Tuple
@@ -48,6 +49,12 @@ import control_params as cp
 import temporal_matrix_cleaner as tmc
 from temporal_matrix_cleaner import OnlineTemporalCleaner
 from target_speed import getTargetSpeed
+from longitudinal_safety import (
+    BEVLongitudinalAdapterConfig,
+    LongitudinalSafetyConfig,
+    LongitudinalSafetyResult,
+    evaluate_longitudinal_safety,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -82,8 +89,22 @@ class LiveFrameResult:
     tracker_latency_ms: float
     active_tracks: int
     coasted_tracks: int
+    # Backwards-compatible alias for the tracker-internal estimate.  New code
+    # should use the two explicit fields below and never infer safety validity
+    # from this legacy name.
     ego_speed_mps: float
+    safety_input_ego_speed_mps: Optional[float]
+    tracker_ego_speed_mps: float
     ego_yaw_rate_rps: float
+    nominal_target_speed_mph: float
+    safe_target_speed_mph: float
+    safety_zone: str
+    critical_boundary_m: Optional[float]
+    collision_boundary_m: Optional[float]
+    obstacle_distance_m: Optional[float]
+    safety_reason: str
+    safety_result: Optional[LongitudinalSafetyResult]
+    obstacle_gap_description: str
     dt_s: float = cp.LIVE_DT
     elapsed_s: float = 0.0
 
@@ -96,8 +117,17 @@ class LiveBEVProcessor:
     tracker is retained inside ``self.cleaner``.
     """
 
-    def __init__(self, nominal_dt: float = cp.LIVE_DT) -> None:
+    def __init__(
+        self,
+        nominal_dt: float = cp.LIVE_DT,
+        safety_config: Optional[LongitudinalSafetyConfig] = None,
+        bev_adapter_config: Optional[BEVLongitudinalAdapterConfig] = None,
+    ) -> None:
         self.cleaner = OnlineTemporalCleaner()
+        self.safety_config = safety_config or LongitudinalSafetyConfig()
+        self.safety_config.validate()
+        self.bev_adapter_config = bev_adapter_config or BEVLongitudinalAdapterConfig()
+        self.bev_adapter_config.validate()
         self.frame_index = -1
         self.nominal_dt = float(nominal_dt)
         self.elapsed_s = 0.0
@@ -151,8 +181,9 @@ class LiveBEVProcessor:
             IMU/localization stack, pass it here; otherwise the existing causal
             scene-based estimator is used.
         ego_speed_mps:
-            Optional measured ego speed [m/s], used by the existing cleaner for
-            annotation/static classification as defined by its current API.
+            Explicit safety input [m/s].  The same value is also forwarded to
+            the existing cleaner for annotation, but it remains distinct from
+            the cleaner's internally maintained ego-speed estimate.
         """
         raw = np.asarray(raw_matrix)
         if raw.shape != (tmc.ROWS, tmc.COLS):
@@ -161,6 +192,11 @@ class LiveBEVProcessor:
             )
         if raw.dtype != np.uint8:
             raw = raw.astype(np.uint8, copy=False)
+
+        if ego_speed_mps is not None:
+            ego_speed_mps = float(ego_speed_mps)
+            if not math.isfinite(ego_speed_mps) or ego_speed_mps < 0.0:
+                raise ValueError("ego_speed_mps must be finite and non-negative")
 
         if dt is None:
             dt = self.nominal_dt
@@ -183,6 +219,16 @@ class LiveBEVProcessor:
 
         ts_raw = float(getTargetSpeed(matrix=raw, **cp.TARGET_SPEED_KW))
         ts_clean = float(getTargetSpeed(matrix=cleaned, **cp.TARGET_SPEED_KW))
+        safety_result: Optional[LongitudinalSafetyResult] = None
+        if ego_speed_mps is not None:
+            safety_result = evaluate_longitudinal_safety(
+                matrix=cleaned,
+                ego_speed_mps=ego_speed_mps,
+                nominal_target_speed_mph=ts_clean,
+                dt=dt,
+                config=self.safety_config,
+                bev_config=self.bev_adapter_config,
+            )
 
         coasted = sum(
             1 for obj in objects
@@ -198,8 +244,30 @@ class LiveBEVProcessor:
             tracker_latency_ms=tracker_latency_ms,
             active_tracks=len(objects),
             coasted_tracks=coasted,
+            # Preserve the old field's tracker-estimate meaning for existing
+            # consumers; safety diagnostics use safety_input_ego_speed_mps.
             ego_speed_mps=float(self.cleaner.ego_speed_mps),
+            safety_input_ego_speed_mps=ego_speed_mps,
+            tracker_ego_speed_mps=float(self.cleaner.ego_speed_mps),
             ego_yaw_rate_rps=float(self.cleaner.ego_yaw_rate),
+            nominal_target_speed_mph=ts_clean,
+            safe_target_speed_mph=(safety_result.safe_target_speed_mph
+                                   if safety_result is not None else ts_clean),
+            safety_zone=(safety_result.zone if safety_result is not None else "UNAVAILABLE"),
+            critical_boundary_m=(safety_result.critical_boundary_m
+                                 if safety_result is not None else None),
+            collision_boundary_m=(safety_result.collision_boundary_m
+                                  if safety_result is not None else None),
+            obstacle_distance_m=(safety_result.obstacle_distance_m
+                                 if safety_result is not None else None),
+            safety_reason=(safety_result.reason if safety_result is not None else
+                           "three-zone safety requires explicit ego_speed_mps"),
+            safety_result=safety_result,
+            obstacle_gap_description=(
+                "front-bumper gap"
+                if self.bev_adapter_config.bev_origin_to_front_bumper_m is not None
+                else "provisional BEV range"
+            ),
             dt_s=dt,
             elapsed_s=self.elapsed_s,
         )
@@ -235,7 +303,7 @@ class BEVRenderer:
         self.y_max = float(y_max_m)
         self.panel_w = int(round((self.y_max - self.y_min) * self.ppm))
         self.panel_h = int(round((self.x_max - self.x_min) * self.ppm))
-        self.info_h = 92
+        self.info_h = 150
 
         # ---- VISUALIZATION-ONLY state ---------------------------------------
         # Previous displayed continuous position per track id, used solely to
@@ -413,18 +481,68 @@ class BEVRenderer:
             f"tracker {result.tracker_latency_ms:6.2f} ms   "
             f"active {result.active_tracks:2d}   coasted {result.coasted_tracks:2d}"
         )
-        line2 = (
-            f"target speed: raw {result.raw_target_speed_mph:5.2f} mph   "
-            f"online {result.cleaned_target_speed_mph:5.2f} mph   "
+        if result.safety_result is None:
+            line2 = (
+                "Zone: UNAVAILABLE   Safety ego speed: not supplied   "
+                "Obstacle distance: not evaluated"
+            )
+            line3 = (
+                f"Critical boundary: n/a   Collision boundary: n/a   "
+                f"Nominal target: {result.nominal_target_speed_mph:5.2f} mph   "
+                f"Safe target: {result.safe_target_speed_mph:5.2f} mph (pass-through)"
+            )
+        else:
+            ego_mph = result.safety_input_ego_speed_mps / 0.44704
+            if result.obstacle_distance_m is None:
+                horizon_m = result.safety_result.observation_horizon_m
+                observed_text = (
+                    "No obstacle observed within unbounded synthetic horizon"
+                    if horizon_m is None else
+                    f"No obstacle observed within {horizon_m:.1f} m provisional BEV horizon"
+                )
+            else:
+                observed_text = (
+                    f"{result.obstacle_gap_description}: "
+                    f"{result.obstacle_distance_m:.1f} m"
+                )
+            line2 = (
+                f"Zone: {result.safety_zone}   Safety ego speed: {ego_mph:5.1f} mph   "
+                f"{observed_text}"
+            )
+            line3 = (
+                f"Critical boundary: {result.critical_boundary_m:.1f} m   "
+                f"Collision boundary: {result.collision_boundary_m:.1f} m   "
+                f"Nominal target: {result.nominal_target_speed_mph:5.2f} mph   "
+                f"Safe target: {result.safe_target_speed_mph:5.2f} mph"
+            )
+        line4 = (
+            f"raw target {result.raw_target_speed_mph:5.2f} mph   "
+            f"tracker ego estimate {result.tracker_ego_speed_mps:5.2f} m/s   "
             f"ego yaw {result.ego_yaw_rate_rps:+.3f} rad/s   "
-            f"ego speed est {result.ego_speed_mps:5.2f} m/s"
+            "q/ESC quit   p pause   r reset   C=coasted   S=passthrough"
         )
-        line3 = "q/ESC quit   p pause   r reset tracker    C=coasted prediction   S=safety pass-through"
+        if result.safety_result is None:
+            line5 = "Coverage: n/a   Critical horizon max speed: n/a"
+        else:
+            max_critical_mps = result.safety_result.maximum_critical_horizon_speed_mps
+            max_speed_text = (
+                "n/a" if max_critical_mps is None
+                else "unbounded" if math.isinf(max_critical_mps)
+                else f"{max_critical_mps / 0.44704:.1f} mph"
+            )
+            line5 = (
+                f"Coverage: {result.safety_result.coverage_status.replace('_', ' ')}   "
+                f"Critical horizon max speed: {max_speed_text}"
+            )
         cv2.putText(info, line1, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.56,
                     (20, 20, 20), 1, cv2.LINE_AA)
         cv2.putText(info, line2, (12, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.56,
                     (20, 20, 20), 1, cv2.LINE_AA)
         cv2.putText(info, line3, (12, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                    (80, 80, 80), 1, cv2.LINE_AA)
+        cv2.putText(info, line4, (12, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.46,
+                    (80, 80, 80), 1, cv2.LINE_AA)
+        cv2.putText(info, line5, (12, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.46,
                     (80, 80, 80), 1, cv2.LINE_AA)
         return np.vstack([body, info])
 
@@ -461,7 +579,11 @@ def replay_matrix_directory(args: argparse.Namespace) -> None:
             # ONE update per newly received matrix.  Replay uses the dataset's
             # nominal dt so results are reproducible; a real sensor callback
             # should pass processor.measure_dt() instead.
-            result = processor.update(raw, dt=dt_nominal)
+            result = processor.update(
+                raw,
+                dt=dt_nominal,
+                ego_speed_mps=args.ego_speed_mps,
+            )
             latencies.append(result.tracker_latency_ms)
 
             if not args.headless:
@@ -523,6 +645,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--end", type=int, default=None)
     ap.add_argument("--ppm", type=float, default=6.0,
                     help="display pixels per meter (visualization only)")
+    ap.add_argument(
+        "--ego-speed-mps",
+        type=float,
+        default=None,
+        help="explicit TEST/measured ego speed for three-zone safety; omitted "
+             "means safety UNAVAILABLE and nominal target pass-through",
+    )
     ap.add_argument("--window-name", default="Live Causal BEV")
     ap.add_argument("--headless", action="store_true",
                     help="run tracker without opening an OpenCV window")
