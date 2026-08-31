@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import io,json,time
+import csv,io,json,time
 from pathlib import Path
 import numpy as np
 import pytest
@@ -7,7 +7,12 @@ import pytest
 from real_longitudinal_safety_runner import (
     CompleteJSONLTailer,LiveFileSampleSource,RealLongitudinalSafetyRunner,
 )
-from realtime_bev_renderer import LEFT,SCALE,TOP,cell_center,render_realtime_frame
+from realtime_bev_renderer import (
+    LEFT,SCALE,TOP,cell_center,input_health_display_lines,
+    render_realtime_frame,safe_target_display_text,
+)
+from run_real_longitudinal_safety import format_input_health_summary
+from run_real_longitudinal_safety import FIELDS
 
 def record(frame,ns,speed=8.0,valid=True):
     return {"frame_id":frame,"raw_matrix_file":f"matrix/{frame:06d}.npy","monotonic_ns":ns,
@@ -51,6 +56,30 @@ def test_invalid_gps_is_unavailable_not_zero_and_imu_fallback():
     assert out.live_result.safety_zone=="UNAVAILABLE"
     assert out.live_result.safety_input_ego_speed_mps is None
     assert out.yaw_rate_source=="TRACKER_ESTIMATE"
+    assert not out.safe_target_available
+    assert out.validated_safe_target_speed_mph is None
+    row=out.log_row()
+    assert row["nominal_target_speed_mph"]==out.live_result.nominal_target_speed_mph
+    assert row["safe_target_available"] is False
+    assert row["safe_target_speed_mph"] is None
+    assert row["safety_status"]=="UNAVAILABLE"
+    assert safe_target_display_text(out)=="UNAVAILABLE"
+    stream=io.StringIO();writer=csv.DictWriter(stream,fieldnames=FIELDS)
+    writer.writeheader();writer.writerow(row)
+    parsed=next(csv.DictReader(io.StringIO(stream.getvalue())))
+    assert parsed["nominal_target_speed_mph"]!=""
+    assert parsed["safe_target_available"]=="False"
+    assert parsed["safe_target_speed_mph"]==""
+
+def test_valid_safety_target_and_recovery_after_invalid_gps():
+    runner=RealLongitudinalSafetyRunner()
+    unavailable=runner.process_sample(matrix(20),record(0,10,valid=False))
+    available=runner.process_sample(matrix(20),record(1,50_000_010,valid=True))
+    assert unavailable.validated_safe_target_speed_mph is None
+    assert available.safe_target_available
+    assert available.validated_safe_target_speed_mph == (
+        available.live_result.safety_result.safe_target_speed_mph)
+    assert safe_target_display_text(available).endswith(" mph")
 
 def test_safe_critical_collision_semantics_unchanged():
     for gap,zone in ((None,"SAFE"),(20,"CRITICAL"),(3,"COLLISION")):
@@ -66,6 +95,12 @@ def test_partial_json_line_is_not_parsed(tmp_path):
     p.write_bytes(payload[:20]);tail=CompleteJSONLTailer(p);tail.poll();assert not tail.records
     with p.open("ab") as h:h.write(payload[20:]+b"\n")
     tail.poll();assert tail.pop(3)["frame_id"]==3
+
+def test_malformed_complete_json_increments_counter_and_remains_stable(tmp_path):
+    p=tmp_path/"s.jsonl";p.write_text("{bad json}\n")
+    tail=CompleteJSONLTailer(p);tail.poll()
+    assert tail.malformed_lines==1 and not tail.records
+    tail.poll();assert tail.malformed_lines==1
 
 def test_matrix_before_sensor_partial_matrix_and_exact_pair(tmp_path):
     d=tmp_path/"matrix";d.mkdir();s=tmp_path/"s.jsonl";s.write_text("")
@@ -84,6 +119,23 @@ def test_sensor_before_matrix_missing_frame_stall_and_no_duplicates(tmp_path):
     np.save(d/"000002.npy",matrix());assert source.poll_ready()==[]
     ready=source.poll_ready();assert [x[0] for x in ready]==[2]
     assert source.poll_ready()==[]
+
+def test_expired_unmatched_frame_and_health_reporting(tmp_path):
+    d=tmp_path/"matrix";d.mkdir();s=tmp_path/"s.jsonl";s.write_text("{bad}\n")
+    np.save(d/"000000.npy",matrix())
+    source=LiveFileSampleSource(d,s,start="earliest",pair_wait_s=0.0)
+    assert source.poll_ready()==[]
+    assert source.poll_ready()==[]
+    health=source.health_snapshot(processed_frames=0)
+    assert health.skipped_unpaired_frames==1
+    assert health.expired_pairs==1
+    assert health.malformed_sensor_lines==1
+    assert health.warning
+    display=" ".join(input_health_display_lines(health))
+    assert "INPUT WARNING" in display and "malformed 1" in display
+    terminal=format_input_health_summary(health)
+    assert "Skipped/unpaired frames:  1" in terminal
+    assert "Malformed sensor lines:   1" in terminal
 
 def test_older_matrix_waits_for_exact_sensor_before_newer_pair(tmp_path):
     d=tmp_path/"matrix";d.mkdir();s=tmp_path/"s.jsonl"
@@ -104,6 +156,10 @@ def test_three_hundred_incremental_frames_once_with_write_order_changes(tmp_path
         else: np.save(p,matrix(20 if f%3==0 else None));s.open("a").write(line)
         source.poll_ready();seen.extend(x[0] for x in source.poll_ready())
     assert seen==list(range(300)) and len(seen)==len(set(seen))
+    health=source.health_snapshot(processed_frames=len(seen))
+    assert health.processed_frames==300
+    assert health.skipped_unpaired_frames==0
+    assert health.malformed_sensor_lines==0
 
 def test_full_renderer_outside_corridor_and_corridor_only_shading():
     m=matrix(20);m[100,5]=1
@@ -118,4 +174,4 @@ def test_full_renderer_outside_corridor_and_corridor_only_shading():
 def test_no_actuation_api_and_log_row_is_bounded():
     r=RealLongitudinalSafetyRunner();out=r.process_sample(matrix(),record(0,10))
     assert not any(hasattr(r,name) for name in ("throttle","brake","steering","can_write"))
-    assert len(out.log_row())==21
+    assert len(out.log_row())==24

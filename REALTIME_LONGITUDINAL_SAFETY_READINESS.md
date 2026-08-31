@@ -79,8 +79,11 @@ derived causally from consecutive top-level `monotonic_ns` values. The existing
 tracker clamp is retained, while raw dt, tracker dt, and clamp status remain
 separate diagnostics.
 
-Invalid GPS never becomes zero speed: V1 safety is marked `UNAVAILABLE` and
-nominal target passes through. Invalid IMU yaw invokes the existing tracker
+Invalid GPS never becomes zero speed: V1 safety is marked `UNAVAILABLE`.
+`LiveBEVProcessor` retains its compatibility pass-through internally, but the
+standalone wrapper exposes no validated safe target, renders `SAFE TARGET SPEED:
+UNAVAILABLE`, and writes a blank safe-target CSV field. The nominal target stays
+visible in its separate field. Invalid IMU yaw invokes the existing tracker
 estimate fallback and is labeled separately. No future frame is used.
 
 ## Safety and display
@@ -96,7 +99,9 @@ the 80 m view are explicitly labeled as beyond the horizon.
 The panel includes frame/timestamp, GPS speed, IMU yaw source/rate,
 diagnostic acceleration, nearest provisional BEV-origin obstacle range,
 boundaries, coverage, nominal and safe targets, raw/tracker dt, tracker latency,
-and total processing latency.
+total processing latency, and compact processed/skipped/malformed/pending input
+health. Nonzero skipped or malformed counts produce an input warning. Shutdown
+prints the final counters.
 
 ## Validation results
 

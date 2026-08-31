@@ -35,6 +35,21 @@ RECORDED_TIMESTAMP = "RECORDED_TIMESTAMP"
 
 
 @dataclass(frozen=True)
+class InputHealthSnapshot:
+    processed_frames: int
+    skipped_unpaired_frames: int
+    malformed_sensor_lines: int
+    expired_pairs: int
+    last_processed_frame_id: Optional[int]
+    pending_matrix_files: int
+    pending_sensor_records: int
+
+    @property
+    def warning(self) -> bool:
+        return self.skipped_unpaired_frames > 0 or self.malformed_sensor_lines > 0
+
+
+@dataclass(frozen=True)
 class RealTimeFrameResult:
     frame_id: int
     sensor_timestamp_ns: int
@@ -55,6 +70,21 @@ class RealTimeFrameResult:
     def safety_available(self) -> bool:
         return self.live_result.safety_result is not None
 
+    @property
+    def safe_target_available(self) -> bool:
+        """Whether V1 actually evaluated and approved a safe-target value."""
+        return self.safety_available
+
+    @property
+    def validated_safe_target_speed_mph(self) -> Optional[float]:
+        if not self.safe_target_available:
+            return None
+        return self.live_result.safety_result.safe_target_speed_mph
+
+    @property
+    def safety_status(self) -> str:
+        return self.live_result.safety_zone if self.safety_available else "UNAVAILABLE"
+
     def log_row(self) -> dict[str, object]:
         safety = self.live_result.safety_result
         return {
@@ -62,6 +92,7 @@ class RealTimeFrameResult:
             "timestamp_ns": self.sensor_timestamp_ns,
             "gps_speed_mps": self.gps.speed_mps,
             "gps_valid": self.gps.valid,
+            "gps_reason": self.gps.reason,
             "speed_source": self.speed_source,
             "imu_yaw_rate_rps": self.imu_yaw.tracker_vehicle_yaw_rate_rps,
             "yaw_rate_source": self.yaw_rate_source,
@@ -71,10 +102,12 @@ class RealTimeFrameResult:
             "bev_obstacle_gap_m": _safety(safety, "input_obstacle_gap_m"),
             "collision_boundary_m": _safety(safety, "collision_boundary_m"),
             "critical_boundary_m": _safety(safety, "critical_boundary_m"),
-            "zone": self.live_result.safety_zone,
+            "zone": self.safety_status,
+            "safety_status": self.safety_status,
+            "safe_target_available": self.safe_target_available,
             "coverage_status": _safety(safety, "coverage_status"),
             "nominal_target_speed_mph": self.live_result.nominal_target_speed_mph,
-            "safe_target_speed_mph": self.live_result.safe_target_speed_mph,
+            "safe_target_speed_mph": self.validated_safe_target_speed_mph,
             "raw_dt_s": self.raw_dt_s,
             "tracker_dt_s": self.tracker_dt_s,
             "dt_clamped": self.dt_clamped,
@@ -290,6 +323,27 @@ class LiveFileSampleSource:
             if limit is not None and len(ready) >= limit:
                 break
         return ready
+
+    def health_snapshot(self, processed_frames: int) -> InputHealthSnapshot:
+        paths = self._matrix_paths()
+        pending_matrices = sum(
+            frame_id > self.last_processed_frame_id
+            and frame_id >= self.minimum_frame_id
+            for frame_id in paths
+        )
+        return InputHealthSnapshot(
+            processed_frames=int(processed_frames),
+            skipped_unpaired_frames=self.skipped_unpaired_count,
+            malformed_sensor_lines=self.tailer.malformed_lines,
+            # Every current skip is caused by expiry of an unusable exact pair.
+            expired_pairs=self.skipped_unpaired_count,
+            last_processed_frame_id=(
+                self.last_processed_frame_id
+                if processed_frames > 0 else None
+            ),
+            pending_matrix_files=pending_matrices,
+            pending_sensor_records=len(self.tailer.records),
+        )
 
 
 def load_matrix_bytes(payload: bytes) -> np.ndarray:

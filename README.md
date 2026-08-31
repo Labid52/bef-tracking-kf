@@ -1,324 +1,282 @@
-# BEV Temporal Tracking with Kalman Filtering
+# Standalone Real-Time Longitudinal Safety
 
-This repository stabilizes a sparse Bird's-Eye-View (BEV) semantic matrix before it is used for longitudinal control.
+This repository contains a separate, read-only longitudinal-safety consumer.
+The upstream perception/sensor program runs normally and requires no changes.
+Our process reads its BEV matrices and GPS/IMU records, then internally runs the
+causal tracker, nominal target-speed baseline, and V1 longitudinal safety layer.
+It displays and logs dynamic `SAFE`, `CRITICAL`, or `COLLISION` zones and the
+validated safe target speed.
 
-The pipeline is:
+There is no throttle, brake, steering, CAN, or other actuation output.
+
+## Architecture
 
 ```text
-Object detection + distance/BEV estimation
-        ↓
-Raw 120×80 semantic matrix
-        ↓
-OnlineTemporalCleaner
-(Kalman prediction + data association + correction)
-        ↓
-Stabilized BEV
-        ├── Live BEV display
-        └── Target-speed calculation / controller
+Upstream producer (unchanged)
+      |
+      +-- matrix/*.npy
+      +-- matrix_sensors.jsonl
+                |
+                v
+run_real_longitudinal_safety.py
+                |
+                +-- persistent causal tracker
+                +-- nominal target-speed baseline
+                +-- dynamic V1 safety zones
+                +-- safe target speed
+                +-- full 120x80 live BEV window
+                +-- streamed CSV log
 ```
 
-The deployment/online mode is **causal**: each output uses only the current frame and tracker state from previous frames. Future frames are not used.
+## Clone or update this branch
 
-## Rates
-
-| | rate | dt |
-|---|---|---|
-| **live deployment (nominal)** | **20 Hz** | **0.05 s** |
-| recorded datasets in this repo (`matrix/`, `realtime_capture/matrix`) | 10 Hz | 0.10 s |
-
-The tracker is rate-aware: `dt` is supplied per call and threaded through every
-physical computation. Time-based policies (coast duration, duplicate evidence
-window, confirmation window, ego-flow baseline) are configured in **seconds**;
-evidence-based policies (`confirm_hits`, `min_track_observations`) remain
-**observation counts**. See `README_LIVE_BEV.md` for the live loop.
-
-## Commands
-
-```bash
-# --- live, 20 Hz: see README_LIVE_BEV.md for the loop; replay the same path ---
-python3 live_bev_viewer.py --matrix-dir realtime_capture/matrix --dt 0.05
-
-# --- reprocess recorded data ---
-python3 run_temporal_cleaning.py --matrix-dir realtime_capture/matrix \
-        --mode causal  --dt 0.05 --out out_causal_20hz     # 20 Hz assumptions
-python3 run_temporal_cleaning.py --matrix-dir realtime_capture/matrix \
-        --mode causal  --dt 0.10 --out out_causal_10hz     # legacy 10 Hz
-python3 run_temporal_cleaning.py --matrix-dir realtime_capture/matrix \
-        --mode offline --dt 0.10 --out out_offline_10hz    # offline (uses future)
-
-# --- validation ---
-python3 test_tracker_regression.py                          # regression suite
-python3 compare_raw_cleaned.py --matrix-dir realtime_capture/matrix \
-        --cleaned-dir out_offline_10hz/matrix_cleaned \
-        --causal-dir  out_causal_10hz/matrix_cleaned
-```
-
-
----
-
-## Input
-
-Each input is a NumPy semantic matrix:
-
-```python
-shape = (120, 80)
-dtype = np.uint8
-```
-
-Geometry:
-
-- Ego reference: `(row=80, col=40)`
-- Resolution: `1 m/cell`
-- Update rate: `10 Hz`
-- `dt = 0.10 s`
-- Forward distance: `x = 80 - row`
-- Lateral distance: `y = col - 40`
-
-Each nonzero cell is treated as a **point detection** at the estimated object/front-face location, not as the full physical footprint of the object.
-
-Main class IDs:
-
-| ID | Class |
-|---:|---|
-| 0 | Empty |
-| 1 | Person |
-| 2 | Bicycle |
-| 3 | Car |
-| 4 | Motorcycle |
-| 5 | Bus |
-| 6 | Truck |
-| 7 | Stop sign |
-| 8 | Traffic light |
-| 9 | Red light |
-| 10 | Yellow light |
-| 11 | Green light |
-
----
-
-## Main Files
-
-| File | Purpose | When to use |
-|---|---|---|
-| `temporal_matrix_cleaner.py` | Main Kalman tracking, data association, offline and causal tracking | Core library; imported by other scripts |
-| `control_params.py` | Shared timing and controller parameters | Keep `DT=0.10` here |
-| `target_speed.py` | Target-speed calculation from BEV | Used after the cleaned matrix is produced |
-| `run_temporal_cleaning.py` | Process a recorded matrix sequence | Generate offline or causal cleaned datasets |
-| `run_cleaned_target_speed.py` | Simple frame-by-frame causal/streaming example | Check the online API |
-| `live_bev_viewer.py` | Real-time BEV visualization | Use to watch the causal BEV update live |
-| `animate_target_speed_bev_cleaned.py` | Create comparison MP4 videos | Recorded-data visualization only |
-| `compare_raw_cleaned.py` | Quantitative evaluation/audit | Compare raw, offline, and causal results |
-
----
-
-## Installation
-
-Clone the repository:
+New clone:
 
 ```bash
 git clone https://github.com/Labid52/bef-tracking-kf.git
 cd bef-tracking-kf
+git checkout bev-tracker-20hz-fixed
 ```
 
-Install the required Python packages:
+Existing clone:
 
 ```bash
-python3 -m pip install numpy scipy matplotlib opencv-python
+git checkout bev-tracker-20hz-fixed
+git pull origin bev-tracker-20hz-fixed
 ```
 
-`ffmpeg` is recommended if you want to generate MP4 videos.
+## Python environment
 
----
+The runtime requires Python 3, NumPy, SciPy, and OpenCV (`cv2`):
 
-## Recorded Matrix Data
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements.txt
+```
 
-For recorded-data scripts, place the matrices in:
+The lab development environment currently warns that its SciPy supports NumPy
+`<1.25` while NumPy 1.26.4 is installed. All reported tests passed despite that
+warning. The compatible ranges in `requirements.txt` avoid this known mismatch
+in a clean environment. This work did not alter the lab environment.
+
+## Required upstream outputs
+
+### Matrix directory
+
+The producer must write sequentially numbered NumPy files:
 
 ```text
-matrix/
-├── 000000.npy
-├── 000001.npy
-├── 000002.npy
-└── ...
+000000.npy
+000001.npy
+000002.npy
+...
 ```
 
-The raw `matrix/` directory should remain unchanged.
-
----
-
-## 1. Run Offline Cleaning
-
-Offline mode uses future observations, RTS smoothing, and tracklet stitching. Use it for analysis and best-quality reconstructed trajectories, **not for live vehicle control**.
-
-```bash
-python3 run_temporal_cleaning.py
-```
-
-Output:
+Each matrix must have:
 
 ```text
-cleaned/
+shape = (120, 80)
+dtype = uint8
+resolution = 1 m/cell
+ego reference = row 80, column 40
 ```
 
----
+### Sensor JSONL file
 
-## 2. Run Causal / Online Cleaning on Recorded Data
+The producer must append one complete JSON object per newline to a file such as
+`matrix_sensors.jsonl`, using the schema validated from `matrix_imu_gps.zip`.
+A shortened representative record is:
 
-This processes the recorded route in causal order using only past + current information:
-
-```bash
-python3 run_temporal_cleaning.py \
-    --mode causal \
-    --out cleaned_causal
+```json
+{
+  "frame_id": 42,
+  "raw_matrix_file": "matrix/000042.npy",
+  "monotonic_ns": 123456789000,
+  "gps": {
+    "connected": true, "received": true, "fix": true,
+    "speed_kph": 18.0, "updated_monotonic_ns": 123456789000,
+    "age_ns": 0, "error": null
+  },
+  "imu": {
+    "connected": true,
+    "roll_deg": 0.0, "pitch_deg": 0.0, "yaw_deg": 0.0,
+    "acceleration_mps2": [0.0, 0.0, 9.80665],
+    "angular_rate_rps": [0.0, 0.0, 0.0],
+    "updated_monotonic_ns": 123456789000,
+    "age_ns": 0, "error": null
+  }
+}
 ```
 
-Output:
+The adapters use `speed_mps = speed_kph / 3.6` and tracker yaw rate
+`= -angular_rate_rps[2]`. Optional GPS latitude, longitude, and satellite
+metadata may also be present.
+
+## Frame matching and sensor assumption
+
+Matrix frame `k` is paired only with sensor record `frame_id == k`. The consumer
+supports matrix-first or sensor-first arrival and never substitutes another
+frame's record. It waits briefly for the exact pair and protects against partial
+matrix writes and incomplete JSONL lines.
+
+At this development stage, a current GPS and IMU record is assumed available
+for every BEV frame. Exact frame IDs and monotonic timestamps are still used.
+Optional multirate research tools remain separate from this primary live path.
+
+## Run the two processes
+
+Terminal 1:
 
 ```text
-cleaned_causal/
+Run your existing BEV/GPS/IMU producer exactly as usual.
+No changes to that producer are required.
 ```
 
-Use this mode when evaluating behavior that is representative of real-time deployment.
-
----
-
-## 3. Watch the BEV Update in Real Time
-
-To replay recorded matrices one at a time at 10 Hz and watch the live causal BEV:
-
-```bash
-python3 live_bev_viewer.py
-```
-
-For a short section:
-
-```bash
-python3 live_bev_viewer.py --start 1110 --end 1190
-```
-
-For processing without a GUI:
-
-```bash
-python3 live_bev_viewer.py --headless --no-realtime
-```
-
-`live_bev_viewer.py` is different from the animation script:
-
-- `live_bev_viewer.py` → displays the current causal output as frames arrive.
-- `animate_target_speed_bev_cleaned.py` → creates an MP4 from recorded results.
-
----
-
-## 4. Use the Tracker in a Live Perception Pipeline
-
-Create the tracker **once**, then call `update()` for every new BEV matrix:
-
-```python
-from temporal_matrix_cleaner import OnlineTemporalCleaner
-
-tracker = OnlineTemporalCleaner()
-
-# Called once for each new matrix from perception
-cleaned_matrix, objects = tracker.update(
-    current_matrix,
-    dt=0.10,
-)
-```
-
-Do **not** create a new tracker every frame. The tracker object stores the previous Kalman states, velocities, IDs, uncertainty, and missed-detection history.
-
-If vehicle/IMU yaw rate is available:
-
-```python
-cleaned_matrix, objects = tracker.update(
-    current_matrix,
-    dt=0.10,
-    ego_yaw_rate=current_yaw_rate,
-)
-```
-
-Recommended live architecture:
+From its configuration, identify:
 
 ```text
-Perception
-   ↓
-Current raw BEV matrix
-   ↓
-OnlineTemporalCleaner.update()
-   ↓
-Current stabilized BEV
-   ├── live_bev_viewer / display
-   └── getTargetSpeed() → longitudinal controller
+<PATH_TO_LIVE_MATRIX_DIRECTORY>
+<PATH_TO_MATRIX_SENSORS_JSONL>
 ```
 
-The visualization should be kept separate from the control loop so control continues even if the display is disabled.
-
----
-
-## 5. Generate Comparison Videos
-
-Offline:
+Terminal 2:
 
 ```bash
-python3 animate_target_speed_bev_cleaned.py \
-    --out cleaned/bev_raw_vs_offline.mp4
+cd <REPOSITORY_PATH>
+
+python3 run_real_longitudinal_safety.py \
+  --matrix-dir <PATH_TO_LIVE_MATRIX_DIRECTORY> \
+  --sensor-file <PATH_TO_MATRIX_SENSORS_JSONL>
 ```
 
-Causal:
+`--matrix-dir` contains numbered `.npy` files. `--sensor-file` is the append-only
+sensor JSONL. Startup defaults to the newest available matrix. Use
+`--start earliest` or `--start FRAME_ID` only when intentional.
 
-```bash
-python3 animate_target_speed_bev_cleaned.py \
-    --cleaned-dir cleaned_causal/matrix_cleaned \
-    --tracks cleaned_causal/tracks.npz \
-    --out cleaned_causal/bev_raw_vs_causal.mp4
+Supported options:
+
+```text
+--matrix-dir PATH    matrix directory (default: matrix)
+--sensor-file PATH   sensor JSONL (default: sensors/matrix_sensors.jsonl)
+--start VALUE        latest, earliest, or integer frame ID
+--poll-ms MS         idle polling interval (default: 10 ms)
+--headless           run without an OpenCV window
+--log PATH           stream CSV to an explicit path
+--no-log             disable CSV logging
 ```
 
----
+Logging defaults to `logs/realtime_safety_YYYYMMDD_HHMMSS.csv`.
 
-## 6. Evaluate the Results
+## What the window shows
 
-Run the comparison report:
+- Complete incoming 120x80 BEV, including objects outside the corridor and
+  behind ego
+- Current zone and safe target speed
+- Dynamic collision and critical boundaries
+- Nearest safety-relevant provisional BEV-origin obstacle range
+- GPS speed, IMU yaw rate/source, and diagnostic IMU acceleration
+- Observation coverage, raw/tracker dt, and processing timing
+- Processed, expired/skipped, malformed, and pending input counters
 
-```bash
-python3 compare_raw_cleaned.py --json cleaned/report.json
+`COLLISION` means the supplied obstacle range is inside the modeled emergency
+stopping boundary. It does **not** mean confirmed physical contact.
+
+## Nominal target versus safe target
+
+```text
+target_speed.py -> NOMINAL TARGET SPEED
+                       |
+                       v
+longitudinal safety -> SAFE TARGET SPEED
 ```
 
-Audit remaining severe events:
+The nominal target can exist when GPS is invalid and V1 cannot evaluate. The
+standalone application then reports:
 
-```bash
-python3 compare_raw_cleaned.py --audit-failures --top 15
+```text
+CURRENT ZONE: UNAVAILABLE
+NOMINAL TARGET SPEED: <numeric baseline value>
+SAFE TARGET SPEED: UNAVAILABLE
 ```
 
-Useful metrics include dropout rate, trajectory jumps, fragmentation, duplicate tracks, target-speed jumps, and safety-audit failures.
+It never labels nominal pass-through as a validated safe target.
 
----
+## Input health
 
-## Offline vs Online
+For a normal stream, expect:
 
-| Feature | Offline | Online/Causal |
-|---|---:|---:|
-| Kalman prediction/correction | Yes | Yes |
-| Data association | Yes | Yes |
-| Short dropout handling | Yes | Yes |
-| Future frames | Yes | **No** |
-| RTS backward smoothing | Yes | **No** |
-| Future tracklet stitching | Yes | **No** |
-| Suitable for live deployment | No | **Yes** |
+```text
+Skipped/unpaired frames: 0
+Malformed sensor lines:  0
+```
 
-The causal implementation has been validated so that adding future frames does not change earlier outputs. It can therefore be used as the basis for real-time integration.
+Nonzero values produce an `INPUT WARNING` and usually indicate wrong paths,
+malformed producer output, or mismatched frame IDs. No safety result is
+fabricated for an unmatched frame.
 
----
+## Logging
 
-## Important Notes
+Rows are streamed directly to disk rather than held indefinitely. Important
+columns include frame/timestamp, GPS validity/reason, IMU yaw and acceleration,
+provisional obstacle range, boundaries, zone/status, nominal target,
+`safe_target_available`, nullable safe target, dt, and processing latency. When
+safety is unavailable, `safe_target_speed_mph` is blank while the numeric
+nominal target remains in its separate column.
 
-- Keep the tracker instance alive across frames.
-- Use `dt = 0.10 s` for the current 10 Hz BEV stream.
-- Do not use offline-smoothed output in a live controller.
-- Tracking improves temporal consistency but does not create new sensor information or correct unknown absolute range bias.
-- Benchmark latency again on the final NVIDIA Thor deployment hardware.
-- Perform shadow-mode/replay validation before allowing the cleaned BEV to affect vehicle actuation.
+## Stopping
 
----
+Use Ctrl+C. With the window focused, q or Esc also exits. Final processing and
+input-health counters are printed during shutdown.
 
-## License
+## Read-only mannequin test
 
-MIT License. See `LICENSE`.
+Initial mannequin testing is read-only. The application only reads, tracks,
+evaluates, displays, and logs. It does not control throttle, brake, steering, or
+CAN.
+
+## Troubleshooting
+
+### No frames appear
+
+Check `--matrix-dir`, verify numbered `.npy` files are being written, and confirm
+the default `--start latest` behavior is appropriate.
+
+### No safety result / SAFE TARGET SPEED is UNAVAILABLE
+
+Check GPS connection, receipt, fix, speed, age, and error fields. Unavailable
+means no valid V1 evaluation existed; it is not a zero-speed measurement or an
+approved nominal target.
+
+### Skipped/unpaired increases
+
+Verify matrix filenames and sensor `frame_id`/`raw_matrix_file` values match and
+that both CLI paths refer to the same producer run.
+
+### Malformed sensor lines increases
+
+Verify the producer emits one complete valid JSON object followed by a newline
+for every record.
+
+### OpenCV/display failure
+
+Use `--headless` to process and log without a window.
+
+### SciPy/NumPy warning
+
+Prefer a clean virtual environment using `requirements.txt`. Do not broadly
+upgrade an established validated environment without rerunning validation.
+
+## Software validation status
+
+The standalone path processed 2,018 synchronized recorded frames with zero GPS,
+collision-boundary, critical-boundary, zone, or valid-safe-target mismatches.
+Producer/consumer emulation processed 300/300 frames with zero duplicates,
+skips, pairing mismatches, or partial-write crashes. The recorded non-render
+path meets the 20 Hz software timing target. No actuation is present.
+
+These are software results, not road validation, physical validation,
+certification, or a guarantee of safety. See
+[REALTIME_LONGITUDINAL_SAFETY_READINESS.md](REALTIME_LONGITUDINAL_SAFETY_READINESS.md)
+for detailed validation and limitations.

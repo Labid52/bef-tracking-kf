@@ -7,6 +7,7 @@ import numpy as np
 
 import control_params as cp
 from live_bev_viewer import CLASS_STYLE, DEFAULT_STYLE
+from real_longitudinal_safety_runner import InputHealthSnapshot
 
 
 ZONE_COLORS = {"SAFE": (50, 190, 70), "CRITICAL": (20, 170, 240),
@@ -19,7 +20,35 @@ def cell_center(row: int, col: int) -> tuple[int, int]:
     return LEFT + col * SCALE + 2, TOP + row * SCALE + 2
 
 
-def render_realtime_frame(frame, timing: dict | None = None) -> np.ndarray:
+def safe_target_display_text(frame) -> str:
+    value = frame.validated_safe_target_speed_mph
+    return "UNAVAILABLE" if value is None else f"{value:.2f} mph"
+
+
+def input_health_display_lines(
+    health: InputHealthSnapshot | None,
+) -> tuple[str, str]:
+    if health is None:
+        return "INPUT / STREAM: unavailable", ""
+    first = (
+        f"INPUT: processed {health.processed_frames}   "
+        f"last frame {health.last_processed_frame_id}"
+    )
+    second = (
+        f"expired/skipped {health.skipped_unpaired_frames}   "
+        f"malformed {health.malformed_sensor_lines}   "
+        f"pending M/S {health.pending_matrix_files}/{health.pending_sensor_records}"
+    )
+    if health.warning:
+        second = "INPUT WARNING: " + second
+    return first, second
+
+
+def render_realtime_frame(
+    frame,
+    timing: dict | None = None,
+    input_health: InputHealthSnapshot | None = None,
+) -> np.ndarray:
     """Render actual full raw/cleaned matrices; boundaries come from result."""
     image = np.full((760, 1240, 3), 242, dtype=np.uint8)
     right = 520
@@ -68,7 +97,7 @@ def render_realtime_frame(frame, timing: dict | None = None) -> np.ndarray:
     zone=result.safety_zone; color=ZONE_COLORS.get(zone,ZONE_COLORS["UNAVAILABLE"])
     cv2.rectangle(image,(right,35),(1215,150),color,-1)
     cv2.putText(image,f"CURRENT ZONE: {zone}",(right+20,80),cv2.FONT_HERSHEY_SIMPLEX,1.0,(255,255,255),3)
-    cv2.putText(image,f"SAFE TARGET SPEED: {result.safe_target_speed_mph:.2f} mph",
+    cv2.putText(image,f"SAFE TARGET SPEED: {safe_target_display_text(frame)}",
                 (right+20,125),cv2.FONT_HERSHEY_SIMPLEX,.8,(255,255,255),2)
     def fmt(value, suffix=""): return "unavailable" if value is None else f"{value:.3f}{suffix}"
     timing=timing or {}
@@ -82,7 +111,7 @@ def render_realtime_frame(frame, timing: dict | None = None) -> np.ndarray:
         ("Critical boundary",fmt(None if safety is None else safety.critical_boundary_m," m")),
         ("Coverage","unavailable" if safety is None else safety.coverage_status),
         ("Nominal target",f"{result.nominal_target_speed_mph:.2f} mph"),
-        ("Safe target",f"{result.safe_target_speed_mph:.2f} mph"),
+        ("Safe target",safe_target_display_text(frame)),
         ("Raw / tracker dt",f"{fmt(frame.raw_dt_s,' s')} / {frame.tracker_dt_s:.3f} s"),
         ("dt clamped",str(frame.dt_clamped)),
         ("Tracker latency",f"{result.tracker_latency_ms:.2f} ms"),
@@ -93,6 +122,10 @@ def render_realtime_frame(frame, timing: dict | None = None) -> np.ndarray:
     for label,text in rows:
         cv2.putText(image,label,(right,y),cv2.FONT_HERSHEY_SIMPLEX,.48,(80,80,80),1)
         cv2.putText(image,text,(right+225,y),cv2.FONT_HERSHEY_SIMPLEX,.48,(20,20,20),1); y+=32
+    health_line_1, health_line_2 = input_health_display_lines(input_health)
+    health_color = (20, 20, 200) if input_health and input_health.warning else (20, 80, 20)
+    cv2.putText(image,health_line_1,(right,665),cv2.FONT_HERSHEY_SIMPLEX,.45,health_color,1)
+    cv2.putText(image,health_line_2,(right,685),cv2.FONT_HERSHEY_SIMPLEX,.42,health_color,1)
     cv2.putText(image,"READ / TRACK / EVALUATE / DISPLAY / LOG ONLY",(right,700),cv2.FONT_HERSHEY_SIMPLEX,.5,(30,30,160),2)
     cv2.putText(image,"Ctrl+C, q, or ESC to exit",(right,730),cv2.FONT_HERSHEY_SIMPLEX,.5,(70,70,70),1)
     return image
