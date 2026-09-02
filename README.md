@@ -267,16 +267,3 @@ Use `--headless` to process and log without a window.
 
 Prefer a clean virtual environment using `requirements.txt`. Do not broadly
 upgrade an established validated environment without rerunning validation.
-
-## Software validation status
-
-The standalone path processed 2,018 synchronized recorded frames with zero GPS,
-collision-boundary, critical-boundary, zone, or valid-safe-target mismatches.
-Producer/consumer emulation processed 300/300 frames with zero duplicates,
-skips, pairing mismatches, or partial-write crashes. The recorded non-render
-path meets the 20 Hz software timing target. No actuation is present.
-
-These are software results, not road validation, physical validation,
-certification, or a guarantee of safety. See
-[REALTIME_LONGITUDINAL_SAFETY_READINESS.md](REALTIME_LONGITUDINAL_SAFETY_READINESS.md)
-for detailed validation and limitations.
