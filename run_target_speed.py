@@ -2,10 +2,17 @@
 
 from pathlib import Path
 import numpy as np
+import time
+import serial
 
 import control_params
 from target_speed import getTargetSpeed
 
+
+ser = serial.Serial(port='/dev/ttyUSB0', baudrate=1000000, timeout=0.1, write_timeout=0.1)
+
+# Allow time for the serial connection to initialize
+time.sleep(2)
 
 # Parameters and paths now come from control_params.py (single source of truth).
 # Two things were corrected here: dt was 0.05 while this dataset is 10 FPS
@@ -49,7 +56,12 @@ def main():
         )
 
         print(f"{path.name:<14} {target_speed_mph:>18.2f}")
+        ser.write(f"V:{target_speed_mph:.2f}\n".encode("ascii"))
 
+        # # Uncomment them if you want to make sure the ESP32 received the message.   
+        # response = ser.readline().decode("ascii", errors="replace").strip()
+        # if response:
+        #     print("ESP32:", response)
 
 if __name__ == "__main__":
     main()
